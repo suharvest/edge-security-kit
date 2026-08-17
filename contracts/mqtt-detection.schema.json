@@ -132,6 +132,11 @@
         "direction": {"enum": ["forward", "backward"], "description": "line_cross only. forward = crossing from the left side to the right side of the directed line start->end (see MQTT.md for the sign convention)"},
         "dwell_s": {"type": "number", "minimum": 0, "description": "loitering only: seconds inside the zone when the event fired"},
         "snapshot_ref": {"type": "string", "description": "Present when a snapshot exists: the snapshot topic suffix or hub storage path"},
+        "origin": {
+          "enum": ["device", "hub"],
+          "default": "device",
+          "description": "Which rule engine produced this event. Absent means `device`. A hub republishing its own verdicts on behalf of a hub-mode device MUST set `hub`, and MUST ignore inbound events carrying it: the hub subscribes to the same events topic family it publishes to, so without this marker it ingests its own echo, reclassifies the device as single-box and stops judging its rules (an observed failure, see HUB_SPEC §1). Only `origin: device` events may set a device's mode."
+        },
         "class": {"type": "string", "minLength": 1},
         "score": {"type": "number", "minimum": 0, "maximum": 1}
       },

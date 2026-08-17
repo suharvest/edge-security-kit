@@ -56,6 +56,12 @@ hub (单 origin, cookie 会话)
 
 导航：hub 顶栏三个 tab + 语言切换 + 当前用户名。设备本地调试页无导航，页顶注明"调试模式——生产使用请访问 hub"。
 
+**当前身份来自 `GET /api/auth/session`**，不存 localStorage。启动时用它把会话 cookie
+解析成用户名与 `must_change`：401 即跳登录页，`must_change=1` 即强制停在改密表单
+（刷新页面绕不过去）。localStorage 里记住的用户名会比 cookie 活得久，效果是已登出的
+访客照样看到工作台外壳，直到第一个 REST 请求返回 401 才被弹走——顶栏显示的用户名也
+可能不是 hub 认的那个账号。
+
 ### 2.1 告警工作台线框
 
 ```
@@ -146,7 +152,9 @@ hub (单 origin, cookie 会话)
 
 ### 3.5 CSV 导出
 
-`ExportDialog`：继承当前筛选条件，可改时间范围 → `GET /api/alerts/export.csv?...` 浏览器直接下载。列：id, ts, device_id, stream_id, event_type, rule_name, track_id, score, state, acted_by, acted_at。UTF-8 带 BOM（Excel 中文兼容）。
+`ExportDialog`：继承当前筛选条件，可改时间范围 → `GET /api/alerts/export.csv?...` 浏览器直接下载。列：id, ts_ms, device_id, stream_id, event_type, rule_name, track_id, score, state, acted_by, acted_at。UTF-8 带 BOM（Excel 中文兼容）。
+
+筛选一律由 hub 执行：`state / device_id / stream_id / event_type / rule_name / date_from / date_to` 全部作为 query 参数下发，`/alerts` 与 `/alerts/export.csv` 认同一组参数（HUB_SPEC §4）。任一维度只在浏览器里过滤，导出就会带上被过滤掉的行——列表与 CSV 对不上，而 CSV 才是交出去的那份。前端的本地过滤只保留一个用途：WS 推来的新告警不属于当前筛选时不插入列表（§7）。
 
 ## 4. 规则编辑器
 
@@ -227,10 +235,15 @@ hub (单 origin, cookie 会话)
 - 消息形状（server→client，`type` 区分）：
 
 ```json
-{"type": "alert.new",    "alert": { "id": 1024, "ts": 1755400000123, "device_id": "jetson-01", "stream_id": "cam-02", "event_type": "zone_enter", "rule_name": "restricted_area", "track_id": 7, "score": 0.82, "state": "new", "snapshot_url": "/api/alerts/1024/snapshot.jpg", "simulated": false }}
-{"type": "alert.update", "alert": { "id": 1024, "state": "acked", "acted_by": "operator", "acted_at": 1755400012000 }}
+{"type": "alert.new",    "alert": { "id": 1024, "ts_ms": 1755400000123, "received_ms": 1755400000188, "device_id": "jetson-01", "stream_id": "cam-02", "event_type": "zone_enter", "rule_name": "restricted_area", "track_id": 7, "score": 0.82, "state": "new", "snapshot_state": "pending", "snapshot_url": null, "simulated": false }}
+{"type": "alert.update", "alert": { "id": 1024, "ts_ms": 1755400000123, "state": "acked", "acted_by": "operator", "acted_at": 1755400012000 }}
 {"type": "device.status","device": { "device_id": "rk3588-02", "online": false, "streams": {"cam-01": {"decode": "sw", "fps": 6.2}} }}
 ```
+
+- **时间字段只有 `ts_ms`**（设备时间戳，展示/取证）与 `received_ms`（hub 接收时刻，
+  排序基准），命名与 HUB_SPEC §6 的列名一致。REST 行与 WS 载荷是同一个序列化结果，
+  前端不写"`ts` 或 `ts_ms` 都接受"的兼容分支：两个名字都能吃下来，等于"hub 一个都
+  没发"这种情况会被静默显示成 1970 年，而不是暴露出来。
 
 - client→server 仅心跳 `{"type":"ping"}`（30s），处置操作走 REST（幂等、可重试、留审计字段）。
 - 重连：指数退避 1s→2s→4s→…→30s 封顶；重连成功后以最后收到的 alert id 调 `GET /api/alerts?after_id=` 补齐 `alert.new` 缺口（id 为 hub 本地单调自增主键，升序返回，无丢单）。断线期间的 `alert.update`（快照迟到、他端改判）不在 after_id 补偿范围——重连后对当前渲染中 `snapshot_state=pending` 或缺图的告警逐条重新 `GET /api/alerts/{id}` 刷新。`ConnBadge` 三态：已连接/重连中(黄)/已断开(红+横幅"实时推送中断，告警可能延迟")。
@@ -239,10 +252,15 @@ hub (单 origin, cookie 会话)
 
 | 操作 | 保护 |
 |---|---|
-| 清空事件（上游一键即清，index.html:1115） | 二次确认弹窗，要求输入设备名或"全部"字样；按钮文案写明不可恢复范围 |
 | 批量误报/批量确认 | 执行后 `UndoBar` 底部悬浮 5s："已标记 N 条误报 [撤销]"，期间操作入暂存，5s 后提交 REST；撤销即放弃提交（单条处置同样走此机制，成本一致） |
 | 规则删除 | 侧栏删除需确认；保存前可放弃全部更改（"还原为已保存版本"） |
-| 配置恢复上传 | diff 摘要预览 + 确认，见 §5 |
+| 配置恢复上传 | diff 摘要预览 + 确认（`TypedConfirm`：需键入设备名才放行），见 §5 |
+
+**已删除："清空全部事件"**（上游 index.html:1115 一键即清）。不是加更强的确认，而是
+连入口一起去掉：hub 也不提供批量删除端点（HUB_SPEC §11）。理由是这个功能的收益与
+代价不对称——留存策略已经按天自动清理，值班员没有"手动清空"的日常需求；而一个能一次
+抹掉全部告警与快照的入口，对拿到会话的人来说是把取证记录一键销毁的能力。确认弹窗防
+的是误操作，防不了这个。`TypedConfirm` 组件保留，用于配置恢复上传。
 
 ## 9. 分期与验收
 

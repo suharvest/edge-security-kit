@@ -29,6 +29,11 @@ sensecraft/security/<device_id>/cmd/snapshot             QoS1, no retain (downli
   so the hub requests evidence by publishing `{"stream_id": ..., "event_id": ...}`
   there; the device answers on the snapshot topic. Devices that run rules locally
   (single-box mode, reCamera) publish snapshots unprompted.
+- `events/<stream_id>` carries traffic in **both** directions relative to the
+  hub: a single-box device publishes its own verdicts there, and a hub
+  republishes its verdicts on the same topic on behalf of hub-mode devices. The
+  `origin` field separates the two (see below); a consumer that both publishes
+  and subscribes here must filter on it.
 
 ## Field semantics
 
@@ -66,6 +71,15 @@ sensecraft/security/<device_id>/cmd/snapshot             QoS1, no retain (downli
   engine (`<device_id>-<stream_id>-<session_id>-<seq>` recommended, so a
   restart cannot reuse an ID). It names the snapshot topic segment; the hub
   stores it as an association column, not as the alert primary key.
+- `origin` (event messages): `device` or `hub`, defaulting to `device` when
+  absent so existing single-box publishers stay conformant. A hub that
+  republishes its own verdicts must stamp `hub`, must ignore inbound events
+  carrying `hub`, and may only set a device's mode from an `origin: device`
+  event. This is not a cosmetic field: the hub subscribes to the same
+  `events/+` family it publishes to, so an unmarked echo makes it classify a
+  hub-mode device as single-box and stop judging that device's rules
+  altogether — observed in integration, where a run produced two zone alerts
+  and then silence.
 - `direction` (line_cross): lines are directed segments `start -> end`. Let
   `side(p) = sign((end-start) × (p-start))` (2-D cross product). A crossing is
   `forward` when the track centroid moves from `side > 0` to `side < 0`
@@ -82,6 +96,23 @@ may carry optional `preview_url` (device-local single-frame JPEG endpoint) and
 `live_url` (device-local live view); the hub passes both through to its UI and
 never proxies either.
 
+**A clean exit must publish `online: false` itself.** The LWT covers exactly one
+case — the connection dying without a DISCONNECT. A publisher that shuts down
+normally (SIGTERM, container stop, `docker compose stop`) sends a DISCONNECT, the
+broker discards the will, and the last retained message on the status topic stays
+whatever the publisher put there — its `online: true` heartbeat. That retained
+payload is then the device's permanent last word: every consumer that connects
+afterwards, including a hub restarted hours later, reads a device that is not
+running as online. The observable result is a zombie device on the fleet page
+with no LWT ever arriving to correct it.
+
+So the shutdown path is normative, not an implementation nicety: before
+disconnecting, publish the status topic retained with `online: false` and no
+`streams` array — the same shape as the registered LWT, so consumers need one
+code path for "device gone" regardless of how it went away. The reference
+implementation is `platforms/generic/esk_generic/detector.py`
+(`publish_status(online=False)` in the shutdown `finally`).
+
 ## Snapshots
 
 Snapshot payloads are raw JPEG bytes (not JSON), ≤ 200 KB. The publisher
@@ -93,14 +124,21 @@ size cap instead.
 ## Modes
 
 **Single-box** (detector and rule engine on the same host): the device-local
-rule engine publishes `events/<stream_id>` and unprompted snapshots. A hub, if
-present, subscribes to events instead of judging rules for that device.
+rule engine publishes `events/<stream_id>` with `origin: device` (or the field
+omitted) plus unprompted snapshots. A hub, if present, subscribes to events
+instead of judging rules for that device.
 
 **Hub mode**: devices publish only detections + status. The hub judges rules,
 requests snapshots via `cmd/snapshot`, and republishes its resulting events to
-the same `events/<stream_id>` topic on behalf of the device, so third-party
-integrations see one uniform topic regardless of where rules ran. A device is
-in exactly one mode at a time, set by device configuration.
+the same `events/<stream_id>` topic on behalf of the device — stamped
+`origin: hub` — so third-party integrations see one uniform topic regardless of
+where rules ran. A device is in exactly one mode at a time, set by device
+configuration.
+
+Mode inference must be echo-safe. A consumer deriving mode from observed
+traffic follows two rules: only an `origin: device` event may mark a device as
+single-box, and an event whose `event_id` is already stored is a duplicate
+rather than fresh evidence of a device-side engine.
 
 ## QoS / retain rationale
 

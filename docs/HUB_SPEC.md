@@ -26,9 +26,47 @@ Hub 是纯 CPU 的 arm64 单容器：订阅探测层 MQTT，判定规则，管�
 | mqtt_ingest | 订阅 detections/status/events/snapshot 四类 topic，JSON 三类过 schema 校验（校验失败计数并丢弃，不 raise）；snapshot 为 JPEG 二进制，校验 magic bytes + 200 KB 上限 | MQTT → 内部队列 |
 | device_registry | 由 status(retain+LWT) 维护设备/流在线状态、decode 健康、版本 | status → 内存态 + devices 表 |
 | rule_engine | 对 hub 模式设备的 detections 逐条判定 zone/line/loiter；单机模式设备直接采信其 events | detections/events → 候选告警 |
-| alert_manager | 冷却去重、生成 event_id、发 cmd/snapshot、回发 events topic、三态状态机 | 候选告警 → alerts 表 + WS 推送 |
+| alert_manager | 冷却去重、生成 event_id、发 cmd/snapshot、回发 events topic（必须打 `origin: "hub"`）、三态状态机 | 候选告警 → alerts 表 + WS 推送 |
 | storage | SQLite（WAL 模式）+ 快照文件目录 + 配置原子写回 | — |
 | http_api | REST/WS/静态文件，cookie 会话鉴权全覆盖（除 /api/health 与 /api/auth/login） | — |
+
+### 1.1 events 回声防护（实测故障模式）
+
+hub 既向 `events/<stream_id>` republish 自己的裁决，又订阅 `events/+`——两者
+是同一个 topic family。没有防护时 hub 会吃下自己的回声，把 hub 模式设备判成
+`single_box`，从此**完全停止判定该设备的规则**。集成测试里的表现是：先出 2 条
+zone 告警，然后再无任何 line_cross / loitering。
+
+两道叠加防护，缺一不可：
+
+1. **origin 标记**：hub republish 的 event 必须带 `origin: "hub"`（契约见
+   MQTT.md）；入站 event 处理路径丢弃 `origin=hub` 的消息。
+2. **event_id 去重**：`event_id` 已在 alerts 表里的 event 视为重复，直接丢弃。
+   兜底覆盖旧版本设备或第三方 bridge 转发时丢掉 origin 的情况。
+
+### 1.2 mqtt_ingest 逐消息容错（实测故障模式）
+
+ingest 的消息循环和 broker 连接在同一个 `async with` 里：处理单条消息的异常若
+逃到 transport 层，会被当成连接错误，客户端断开并进入指数退避重连。故障模式是
+放大式的——一条报文触发的 handler 异常（下游 handler 的 bug、settings 缺字段、
+DB 约束冲突等）会连带停掉**全部** topic 的摄入，而且只要触发条件还在（例如 A1
+那种持续撞 UNIQUE 的插入），每次重连收到同一条 retained/重发报文就再断一次，
+形成断-连循环。
+
+条款：
+
+1. **per-message 隔离**：每条消息的 dispatch 必须包在自己的 try 里，
+   `asyncio.CancelledError` 透传（停机路径），其余异常记日志后继续循环，不得
+   影响连接。schema 校验失败本就是计数并丢弃（§1 表），这条覆盖的是校验通过
+   之后 handler 内部的异常。
+2. **计数可见**：被隔离的异常累加到 `handler_errors`，由 `GET /api/health` 暴露
+   ——静默吞异常与让连接崩掉一样不可接受，运维要能看到"在丢消息"。
+
+实现：`mqtt_ingest.py:103-119`（隔离与计数）、`app.py:167`（health 暴露）。
+
+模式判定条款：device_registry 只能由 `origin=device`（含字段缺省）的 event 将
+设备标记为 `single_box`。detections 到达不改变模式；模式一旦由设备配置或
+device 侧 event 确定，hub 不再自行翻转。
 
 进程模型：单进程 asyncio（aiomqtt + aiohttp 或等价物）。事件速率是每秒个位数，
 detections 峰值约 8 设备 × 4 流 × 15 Hz = 480 msg/s、每条 ≈1 KB——JSON 解析
@@ -48,7 +86,7 @@ detections 峰值约 8 设备 × 4 流 × 15 Hz = 480 msg/s、每条 ≈1 KB—�
 | behavior_demo.py:71-72 | `norm_px` 像素换算 | — | 删除（全程归一化空间） |
 | multi_camera_manager.py:521-540 | zone_enter + loitering（`zone_entered_at` 进出簿记 + dwell 超时） | rules/zone.py | 原样迁移；dwell 计时改用 **hub 接收时刻的本地单调时钟**（设备 `timestamp` 仅展示/取证，见 §2.1 时钟条款） |
 | multi_camera_manager.py:542-554 | line_cross（前后两帧质心连线与线段相交） | rules/line.py | 补方向：`side(prev)` 与 `side(curr)` 符号翻转判 forward/backward（约定见 MQTT.md），规则配置新增 `direction: any\|forward\|backward`，默认 any |
-| multi_camera_manager.py:464-482 | `_emit` 冷却（挂在 track 上） | alert_manager | 冷却键改为 `(device_id, stream_id, rule_name, track_id)`，并叠加流级限速（同一 rule 每 N 秒最多 1 条，默认 N=cooldown），修复换 track ID 重复报警 |
+| multi_camera_manager.py:464-482 | `_emit` 冷却（挂在 track 上） | alert_manager | 冷却键改为五元组 `(device_id, stream_id, rule_name, event_type, track_id)`，修复换 track ID 重复报警。`event_type` 必须在键里：zone_enter 与 loitering 共用同一个 rule_name（区域名），旧代码的冷却本就分事件类型（`track.fired_events[etype]`）；退成四元组会让同一 track 的入侵告警吞掉随后的滞留升级——丢的是两者中更严重的那条。另有可选流级限速 `stream_rate_limit_s`（同一 `(device_id, stream_id, rule_name, event_type)` 每 N 秒最多 1 条，即去掉 track_id 的同一把键），**默认 0 = 不限流**：非零值会把同时触发同一规则的两个人合并成一条告警，漏报比重复报警更严重，故为 opt-in |
 | 每 track `zone_entered_at`/`fired_events` | 规则状态 | rules/state.py | 状态按 `(device_id, stream_id, track_id)` 三级索引；track 在 detections 中消失超过 `track_expiry_s`（默认 5s）清除状态 |
 
 **配置索引变更**：旧 `camera_zones` 按 `cam-0` 单级索引 → 新规则按
@@ -87,6 +125,15 @@ detections 峰值约 8 设备 × 4 流 × 15 Hz = 480 msg/s、每条 ≈1 KB—�
   分离（后者仅作关联列）。WS 断线补齐依赖此主键：`GET /alerts?after_id=`
   按 id 升序返回，保证 `alert.new` 不丢；快照迟到类 `alert.update` 不经
   after_id 补偿（见 §5）。
+- **event_id 序列必须可从存储恢复**（实测故障模式）：hub 生成的 `event_id` 是
+  `<device>-<stream>-<session>-<seq>`，`seq` 的计数器在内存里，而 `session_id`
+  由设备进程持有。hub 重启时设备并不重启，`session_id` 不变——计数器若从 1 重
+  新开始，生成的就是 alerts 表里已存在的 event_id，撞 UNIQUE 约束插入失败。
+  失败还不是单条丢失：冷却戳在 INSERT 之前就已落下（见 §2 冷却行），所以重试
+  被冷却挡住，**该设备的告警从此永久停止**，直到设备自己重启换 session。
+  条款：某 `(device_id, stream_id, session_id)` 在本进程内第一次取序号时，必须
+  以存储中该前缀已有的最大 `seq` 作为起点播种，而不是 0。
+  实现：`storage.py:max_event_seq` / `alert_manager.py:73-85`。
 - 快照获取异步：告警先入库推送（`snapshot_state=pending`），快照到达后
   UPDATE 并再推一次 WS。快照关联状态机
   `snapshot_state ∈ pending / received / timeout / none`：
@@ -124,24 +171,27 @@ device_registry 会另行标记）；晚到快照仍按 §3 状态机关联。�
 | Method | Path | 说明 |
 |---|---|---|
 | GET | /health | 存活 + mqtt 连接态 + schema 校验失败计数，无鉴权 |
-| GET | /alerts | 过滤：`state,device_id,stream_id,event_type,date_from,date_to,after_id,limit,offset`（默认 limit=50，按 ts 倒序；带 `after_id` 时按 id 升序返回 id 更大的行，供 WS 重连补齐） |
+| GET | /alerts | 过滤：`state,device_id,stream_id,event_type,rule_name,date_from,date_to,after_id,limit,offset`（默认 limit=50，按 `ts_ms` 倒序；带 `after_id` 时按 id 升序返回 id 更大的行，供 WS 重连补齐）。`rule_name` 精确匹配 |
 | POST | /alerts/{id}/ack | 迁移到 acked（合法来源 new/dismissed，见 §3）；非法迁移 409 |
 | POST | /alerts/{id}/dismiss | 迁移到 dismissed（合法来源 new/acked）；非法迁移 409 |
 | POST | /alerts/ack | 批量：入参 `{ids:[]}`，上限 500，返回逐条结果（成功/409/404） |
 | POST | /alerts/dismiss | 批量：同上 |
-| GET | /alerts/export.csv | 同 /alerts 过滤参数，UTF-8 BOM CSV |
+| GET | /alerts/{id} | 单条告警。前端 WS 重连后用它刷新"渲染中但缺快照"的行（FRONTEND_SPEC §7：`alert.update` 不经 after_id 补偿） |
+| GET | /alerts/stats | 按 `rule_name` 聚合的处置统计（total/new/acked/dismissed + 误报率），支持 /alerts 的同一组过滤参数；§3 的误报率阈值提示与 ShiftStats 由它驱动 |
+| GET | /alerts/export.csv | 同 /alerts 过滤参数（含 `rule_name`），UTF-8 BOM CSV。列名 `id, ts_ms, device_id, stream_id, event_type, rule_name, track_id, score, state, acted_by, acted_at`。两个端点共用同一份查询参数解析，导出与它所来自的列表覆盖同一批行——任一过滤维度只在前端实现，导出就会漏过该维度 |
 | GET | /alerts/{id}/snapshot.jpg | 快照文件；无则 404 |
 | GET | /devices | 设备列表：在线态、最后心跳、各流 state/fps/decode、`fallback_active` 醒目标记；透传流的 `preview_url`/`live_url`（来自 status 消息，供规则画布底图与"实时画面"跳转） |
 | GET | /rules | 全量规则（两级索引树） |
 | GET | /rules/{device_id}/{stream_id} | 单流规则 |
 | PUT | /rules/{device_id}/{stream_id} | 整体替换该流 zones+lines+features+cooldown；校验通过即生效并持久化 |
-| POST | /rules/{device_id}/{stream_id}/simulate | 入参 `{rule_id}`；构造 `meta.simulated=true` 的告警走完整链路（入库、WS 推送），供画完规则后自测 |
+| POST | /rules/{device_id}/{stream_id}/simulate | 入参 `{rule_id}`；构造 `meta.simulated=true` 的告警走完整链路（入库、WS 推送），供画完规则后自测。**绕过冷却**（自测不该被上一条真实告警挡住），且**不发 cmd/snapshot**（没有对应真实帧），落库即 `snapshot_state=none` |
 | GET | /devices/{device_id}/config | 该设备全部流的规则+摄像头配置 JSON 导出（备份下载） |
-| PUT | /devices/{device_id}/config | 恢复上传，同 /rules 校验与持久化语义，rev 照常自增 |
+| PUT | /devices/{device_id}/config | 恢复上传，同 /rules 校验与持久化语义，rev 照常自增。**仅恢复规则**：契约没有摄像头配置的下行通道，导出体里的 `camera` 块是信息性的，恢复时不会推回设备（列入未来项，需要新增 `cmd/config` 下行才能闭环） |
 | GET | /live/{device_id}/{stream_id} | 该流最近一条 detections（内存态），供前端画规则时叠加参考框；无视频代理 |
 | GET | /config | hub 自身配置（broker 地址、留存天数等） |
 | PUT | /config | 同上；重启生效项在响应中列出 |
 | POST | /auth/login | 入参用户名+密码；成功签发 HttpOnly+SameSite=Strict 会话 cookie，无鉴权 |
+| GET | /auth/session | 当前会话的用户名与 `must_change`；前端据此决定是否强制跳改密页 |
 | POST | /auth/logout | 作废当前会话 |
 | POST | /auth/password | 修改唯一账户密码，入参旧密+新密；成功后其余会话作废 |
 
@@ -150,6 +200,8 @@ device_registry 会另行标记）；晚到快照仍按 §3 状态机关联。�
 - 原子性：写 `<file>.tmp` + `fsync` + `rename`；SQLite 同事务写 config_versions。
 - 版本：规则每次 PUT 使 `rev` 自增；config_versions 保留最近 50 版，支持人工回滚（直接 PUT 旧版本体，不提供自动回滚接口）。
 - 响应必须携带持久化结果（`rev` + 落盘时间），前端据此显示"已保存·rev N"。
+- hub 自身配置（`PUT /config`）不另建表：存 config_versions 的 `scope='hub'`，
+  同 scope 内 `rev` 最大的行即当前值。§6 的 DDL 因此保持不变。
 
 ## 5. WS 推送
 
@@ -161,6 +213,11 @@ device_registry 会另行标记）；晚到快照仍按 §3 状态机关联。�
 {"type": "alert.update", "alert": { ... }}          // 快照到达、状态被他端修改
 {"type": "device.status","device": { ... }}          // 上下线、decode 变化、fallback_active 翻转
 ```
+
+`alert` 载荷就是 §6 的 alerts 行（加 `snapshot_url`/`simulated` 两个派生字段），
+字段名与列名一致：设备时间戳只叫 **`ts_ms`**，没有 `ts` 之类的别名。REST 与 WS
+共用同一个序列化函数，前端因此不需要"两个名字都接受"的兼容分支——那种分支只会
+让"hub 一个都没发"看起来像正常情况。
 
 不做客户端上行（处置走 REST，客户端仅心跳 ping）。断线重连后前端以
 `GET /alerts?after_id=<last_seen>` 补齐 `alert.new` 缺口（按 hub 本地自增 id
@@ -238,8 +295,14 @@ CREATE TABLE auth (
   存储）后签发 HttpOnly + SameSite=Strict 会话 cookie；REST 与 WS 同用此
   cookie（浏览器无法给 WS 握手自定义 Authorization 头，Basic Auth 凭据是否随
   WS 发送依浏览器而异，故不采用）。未登录 REST 返回 401，前端跳登录页。
-  初始密码随机生成打印到容器日志，`must_change=1` 时前端强制改密后才放行
-  其余页面。会话服务端存储（内存 + 重启失效即可），空闲过期默认 7 天。
+  **没有固定默认密码**（不接受 admin/admin 之类出厂凭据——安防产品自己的
+  控制台带出厂密码是要避免的失效模式）。首次启动（auth 表为空）时：
+  - 若设置了 `HUB_ADMIN_PASSWORD` 环境变量，用它；
+  - 否则随机生成 ≥16 字符的密码，同时写入容器日志（WARNING 级）与
+    `<data_dir>/initial-password.txt`（权限 0600，供漏看启动输出的运维读取）。
+
+  两种情况都置 `must_change=1`，前端强制改密后才放行其余页面。会话服务端存储
+  （内存 + 重启失效即可），空闲过期默认 7 天。
 - 传输安全：LAN 场景 v1 不内置 TLS；对外暴露时前置反向代理终结 TLS（文档注明）。
 - MQTT broker：单机模式 mosquitto 只监听 127.0.0.1 可匿名；hub 模式监听 LAN
   必须启用账号（v1 全体探测设备共享一组凭据，per-device 凭据列入 v2）。
@@ -283,10 +346,12 @@ RSS < 300 MB、SQLite 写放大可忽略（仅事件落库）。镜像目标 < 1
 
 ## 10. 验收要点（并入性能验收清单）
 
-- 契约：hub 对三类消息的 fixture 校验进 CI；坏消息（缺 coordinate_space、
-  坐标越出 [0,1]）必须被拒收且计数可见。schema 只能校验 [0,1] 范围——
-  范围内的 letterbox 坐标错误 hub 无法在线识别，由各平台 conformance
-  fixture 用非正方形源视频对照真值验证。
+- 契约：CI 跑 `contracts/check_fixtures.sh`——遍历 `contracts/fixtures/` 下全部
+  fixture 过 `validate_payload.py`，任一失败即非零退出。fixture 是从真实运行
+  抓下来的报文（来源见 `contracts/fixtures/README.md`），不是手写样例。
+  坏消息（缺 coordinate_space、坐标越出 [0,1]）必须被拒收且计数可见。
+  schema 只能校验 [0,1] 范围——范围内的 letterbox 坐标错误 hub 无法在线识别，
+  由各平台 conformance fixture 用非正方形源视频对照真值验证。
 - 注入压测：mediamtx + 探测容器 8×15 Hz 实流，hub CPU/RSS 达 §8 预算；
   告警端到端（探测帧 → WS 推送）P95 < 1 s（需核实）。
 - 断电重启：规则、告警、处置状态全存活（对照旧版内存态丢失）。
@@ -297,3 +362,7 @@ RSS < 300 MB、SQLite 写放大可忽略（仅事件落库）。镜像目标 < 1
 不聚合视频流（点开告警跳设备本地流）、无录像时间轴/NVR 存储管理、无 PTZ、
 无电子地图、无多租户/角色树、无工单流转、无人脸/车牌检索。detections 不落库、
 不回放。以上任何一项的需求出现时，答案是对接第三方 VMS，不是在 hub 里长出来。
+
+**无批量删除端点**：没有 `DELETE /alerts`、没有"清空全部事件"。告警是取证记录，
+清理由 §6 的留存策略按天自动做；一个能一次抹掉全部证据的端点，对合法用户省下
+的是几次点击，对拿到会话的人省下的是全部工作量。单条删除同理不提供。
