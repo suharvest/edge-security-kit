@@ -1,0 +1,18 @@
+# Independent from the fall-detection fixture: own container name and port
+# (8555) so both can run on the same host without colliding.
+rtspAddress: :8555
+rtspTransports: [tcp]
+# Only RTSP. Left enabled, RTMP/HLS/WebRTC/SRT bind their default ports and
+# collide with any other mediamtx already running in host network mode.
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+paths:
+  edge-sec-720p:
+    source: publisher
+  edge-sec-1080p:
+    source: publisher
+  # Synthetic ground-truth clip, published by publish_truth.sh (see README).
+  edge-sec-truth:
+    source: publisher
