@@ -36,12 +36,29 @@ USER = os.environ.get("ESK_HUB_USER", "admin")
 PW = os.environ.get("ESK_HUB_PASSWORD", "e2e-truth-run-2026")
 OBSERVE_S = float(sys.argv[1]) if len(sys.argv) > 1 else 130.0
 
-TRUTH_DEV, TRUTH_STREAM = "generic-truth", "cam-0"
-ADL_DEV, ADL_STREAM = "generic-adl", "cam-1"
+# Device/stream ids are overridable so the same assertions can be pointed at an
+# accelerated platform without forking the harness. ESK_SKIP_ADL runs the truth
+# stream alone, for a board hosting a single detector.
+TRUTH_DEV = os.environ.get("ESK_TRUTH_DEVICE", "generic-truth")
+TRUTH_STREAM = os.environ.get("ESK_TRUTH_STREAM", "cam-0")
+ADL_DEV = os.environ.get("ESK_ADL_DEVICE", "generic-adl")
+ADL_STREAM = os.environ.get("ESK_ADL_STREAM", "cam-1")
+SKIP_ADL = os.environ.get("ESK_SKIP_ADL", "").lower() in ("1", "true", "yes")
 
 truth = json.loads((FIX / "truth.json").read_text())
 FPS, NF, CX = truth["fps"], truth["n_frames"], truth["cx_by_frame"]
 LINE = truth["geometry"]["line"]
+# The line x is overridable, and on a hardware-scaled platform it has to be.
+# The detector's coordinates are quantized to the decoder's output grid: MPP/RGA
+# emits 640 px wide for a 1280x720 source, so a published cx can only land on a
+# multiple of 1/640 -- and 0.5 is exactly one of them (320/640). A track walking
+# across a line at exactly x=0.5 therefore produces a sample sitting ON the line
+# rather than straddling it, side() returns 0, and neither this harness nor the
+# hub sees the sign flip that defines a crossing. Nudging the line off the grid
+# makes the crossing unambiguous. See the RK platform README.
+if os.environ.get("ESK_LINE_X"):
+    _lx = float(os.environ["ESK_LINE_X"])
+    LINE = {"start": [_lx, LINE["start"][1]], "end": [_lx, LINE["end"][1]]}
 ZONE = truth["geometry"]["zone_points"]
 DWELL = truth["geometry"]["dwell_seconds"]
 ZX = (min(p[0] for p in ZONE), max(p[0] for p in ZONE))
@@ -157,6 +174,9 @@ def align(rows):
             "max_abs_cx_err": round(res[-1], 5)}
 
 
+LINE_X = LINE["start"][0]
+
+
 def side(px):
     s, e = LINE["start"], LINE["end"]
     cross = (e[0] - s[0]) * (0.5 - s[1]) - (e[1] - s[1]) * (px - s[0])
@@ -185,7 +205,7 @@ def observed_events(rows):
             "backward" if (sp < 0 and sc > 0) else None)
         if not direction:
             continue
-        frac = (0.5 - prev["cx"]) / (cur["cx"] - prev["cx"])
+        frac = (LINE_X - prev["cx"]) / (cur["cx"] - prev["cx"])
         out.append({"event_type": "line_cross", "direction": direction,
                     "truth_ts_ms": prev["ts_ms"] + frac * (cur["ts_ms"] - prev["ts_ms"]),
                     "frame_id": cur["frame_id"], "track_id": cur["track_id"],
@@ -215,8 +235,10 @@ def main() -> int:
     print(json.dumps(api("POST", "/auth/login", {"username": USER, "password": PW})))
 
     print("== PUT rules")
-    for dev, st, body in ((TRUTH_DEV, TRUTH_STREAM, TRUTH_RULES),
-                          (ADL_DEV, ADL_STREAM, ADL_RULES)):
+    targets = [(TRUTH_DEV, TRUTH_STREAM, TRUTH_RULES)]
+    if not SKIP_ADL:
+        targets.append((ADL_DEV, ADL_STREAM, ADL_RULES))
+    for dev, st, body in targets:
         r = api("PUT", f"/rules/{dev}/{st}", body)
         print(f"  {dev}/{st} rev={r.get('rev')} persisted_ms={r.get('persisted_ms')}")
     (OUT / "rules-truth.json").write_text(json.dumps(TRUTH_RULES, indent=2))
@@ -354,63 +376,88 @@ def main() -> int:
         if abs(err) > TOL_S:
             fails.append(f"zone_enter alert {a['id']}: err {err:.3f}s > {TOL_S}s")
 
-    # loitering: the FIRST alert per track is the one under test. The rule keeps
-    # re-firing every cooldown while the target stays inside, by design, so the
-    # repeats are reported but not matched against fresh truth instants.
-    l_want = {e["track_id"]: e for e in obs if e["event_type"] == "loitering"}
+    # loitering: one first-fire per ZONE ENTRY, not per track.
+    #
+    # The obvious version keys expected loitering by track_id and calls the
+    # first alert for that track the one under test. That silently assumes the
+    # tracker keeps re-issuing IDs -- true of the CPU detector, whose frame gaps
+    # expire tracks every loop. A detector with stable tracking (the RK platform
+    # holds one track_id across the whole run) has ONE track with MANY entries,
+    # so keying by track kept only the last entry and matched the earliest alert
+    # against it, producing a ~-124 s "error" on a correct alert.
+    l_want_by_track: dict[int, list[dict]] = {}
+    for e in obs:
+        if e["event_type"] == "loitering":
+            l_want_by_track.setdefault(e["track_id"], []).append(e)
+    for entries in l_want_by_track.values():
+        entries.sort(key=lambda e: e["truth_ts_ms"])
+
     l_all = sorted([a for a in tal if a["event_type"] == "loitering"],
                    key=lambda x: x["id"])
-    l_first: dict[int, dict] = {}
-    repeats = []
+    l_by_track: dict[int, list[dict]] = {}
     for a in l_all:
-        if a["track_id"] in l_first:
-            repeats.append(a)
-        else:
-            l_first[a["track_id"]] = a
-    for tid, a in l_first.items():
-        e = l_want.get(tid)
-        if e is None:
-            # Same observation-boundary blind spot as zone_enter: for a track
-            # already alive when the tap opened, the hub knows the entry instant
-            # and the harness does not, so its dwell cannot be checked. An edge
-            # track is skipped; any other track without a truth entry is a fault.
-            if tid in edge_tracks:
-                matched.append({"id": a["id"], "event_type": "loitering",
-                                "rule_name": a["rule_name"], "direction": None,
-                                "dwell_s": a["dwell_s"],
-                                "snapshot_state": a["snapshot_state"],
-                                "track_id": tid, "truth_ts_ms": None,
-                                "alert_received_ms": a["received_ms"],
-                                "err_s": None, "truth_frame_id": None,
-                                "role": "skipped-entry-predates-tap"})
+        l_by_track.setdefault(a["track_id"], []).append(a)
+
+    tol_ms = TOL_S * 1000.0
+    for tid, alerts in sorted(l_by_track.items()):
+        wants = l_want_by_track.get(tid, [])
+        unused = sorted(alerts, key=lambda x: x["received_ms"])
+        for e in wants:
+            # The first fire for this entry is the earliest alert at or after
+            # the instant dwell_seconds elapsed.
+            cands = [a for a in unused if a["received_ms"] >= e["truth_ts_ms"] - tol_ms]
+            if not cands:
+                fails.append(f"loitering: no alert for track {tid} entry at "
+                             f"{e['truth_ts_ms']}")
                 continue
-            fails.append(f"loitering alert {a['id']} for track {tid} with no truth entry")
-            continue
-        err = (a["received_ms"] - e["truth_ts_ms"]) / 1000.0
-        matched.append({"id": a["id"], "event_type": "loitering",
-                        "rule_name": a["rule_name"], "direction": None,
-                        "dwell_s": a["dwell_s"], "snapshot_state": a["snapshot_state"],
-                        "track_id": tid, "truth_ts_ms": e["truth_ts_ms"],
-                        "alert_received_ms": a["received_ms"], "err_s": round(err, 4),
-                        "truth_frame_id": e["frame_id"], "role": "first"})
-        if abs(err) > TOL_S:
-            fails.append(f"loitering alert {a['id']} (track {tid}): first fire "
-                         f"err {err:.3f}s > {TOL_S}s")
-        if a["dwell_s"] is None or abs(a["dwell_s"] - DWELL) > 1.0:
-            fails.append(f"loitering alert {a['id']}: dwell_s={a['dwell_s']} "
-                         f"not within 1s of {DWELL}")
-        # nothing may fire before the dwell has elapsed
-        early = a["received_ms"] - e["entered_ts_ms"]
-        if early < DWELL * 1000.0 - TOL_S * 1000.0:
-            fails.append(f"loitering alert {a['id']} fired {early/1000:.3f}s after "
-                         f"entry, before dwell_seconds={DWELL}")
-    for a in repeats:
-        matched.append({"id": a["id"], "event_type": "loitering",
-                        "rule_name": a["rule_name"], "direction": None,
-                        "dwell_s": a["dwell_s"], "snapshot_state": a["snapshot_state"],
-                        "track_id": a["track_id"], "truth_ts_ms": None,
-                        "alert_received_ms": a["received_ms"], "err_s": None,
-                        "truth_frame_id": None, "role": "repeat-by-design"})
+            a = cands[0]
+            unused.remove(a)
+            err = (a["received_ms"] - e["truth_ts_ms"]) / 1000.0
+            matched.append({"id": a["id"], "event_type": "loitering",
+                            "rule_name": a["rule_name"], "direction": None,
+                            "dwell_s": a["dwell_s"],
+                            "snapshot_state": a["snapshot_state"],
+                            "track_id": tid, "truth_ts_ms": e["truth_ts_ms"],
+                            "alert_received_ms": a["received_ms"],
+                            "err_s": round(err, 4),
+                            "truth_frame_id": e["frame_id"], "role": "first"})
+            if abs(err) > TOL_S:
+                fails.append(f"loitering alert {a['id']} (track {tid}): first fire "
+                             f"err {err:.3f}s > {TOL_S}s")
+            if a["dwell_s"] is None or abs(a["dwell_s"] - DWELL) > 1.0:
+                fails.append(f"loitering alert {a['id']}: dwell_s={a['dwell_s']} "
+                             f"not within 1s of {DWELL}")
+            # nothing may fire before the dwell has elapsed
+            early = a["received_ms"] - e["entered_ts_ms"]
+            if early < DWELL * 1000.0 - tol_ms:
+                fails.append(f"loitering alert {a['id']} fired {early/1000:.3f}s after "
+                             f"entry, before dwell_seconds={DWELL}")
+
+        earliest = wants[0]["truth_ts_ms"] if wants else None
+        for a in unused:
+            if earliest is not None and a["received_ms"] < earliest - tol_ms:
+                # Fired for an entry that happened before the tap opened: the hub
+                # knows that entry instant and the harness does not, so the dwell
+                # cannot be checked. With a stable track_id this is normal at the
+                # start of every window, not just for a track at the edge.
+                role = "skipped-entry-predates-tap"
+            elif not wants:
+                if tid not in edge_tracks:
+                    fails.append(f"loitering alert {a['id']} for track {tid} "
+                                 f"with no truth entry")
+                    continue
+                role = "skipped-entry-predates-tap"
+            else:
+                # The rule re-fires every cooldown while the target stays inside,
+                # by design; reported but not matched to a fresh truth instant.
+                role = "repeat-by-design"
+            matched.append({"id": a["id"], "event_type": "loitering",
+                            "rule_name": a["rule_name"], "direction": None,
+                            "dwell_s": a["dwell_s"],
+                            "snapshot_state": a["snapshot_state"],
+                            "track_id": a["track_id"], "truth_ts_ms": None,
+                            "alert_received_ms": a["received_ms"], "err_s": None,
+                            "truth_frame_id": None, "role": role})
     matched.sort(key=lambda m: m["id"])
     (OUT / "matched.json").write_text(json.dumps(matched, indent=2))
 
@@ -485,6 +532,16 @@ def main() -> int:
         if a["snapshot_state"] != "received":
             fails.append(f"alert {a['id']} snapshot_state={a['snapshot_state']}")
     (OUT / "snapshots.json").write_text(json.dumps(snaps, indent=2))
+
+    if SKIP_ADL:
+        print("\n== ADL stream skipped (ESK_SKIP_ADL)")
+        print("\n== FAILURES")
+        for f in fails:
+            print("  FAIL", f)
+        if not fails:
+            print("  none")
+        (OUT / "failures.json").write_text(json.dumps(fails, indent=2))
+        return 1 if fails else 0
 
     print("\n== ADL stream (second camera) alerts")
     adl = [a for a in new_alerts if a["device_id"] == ADL_DEV]
