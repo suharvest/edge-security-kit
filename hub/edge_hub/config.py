@@ -9,14 +9,64 @@ needs to set before the file exists (HUB_SPEC §8 compose ``MQTT_HOST``).
 from __future__ import annotations
 
 import os
+import re
+import secrets
+import socket
 from typing import Any
+
+CLIENT_ID_PREFIX = "edge-security-hub"
+
+
+def _host_slug() -> str:
+    try:
+        host = socket.gethostname().split(".")[0]
+    except OSError:  # pragma: no cover - gethostname failing is exotic
+        host = ""
+    slug = re.sub(r"[^A-Za-z0-9-]+", "-", host).strip("-").lower()[:24]
+    return slug or "host"
+
+
+def default_client_id() -> str:
+    """A fresh MQTT client id: ``edge-security-hub-<host>-<4 hex>``.
+
+    MQTT client ids are exclusive per broker: a second connection presenting an
+    id already in use takes the session over and the first client is
+    disconnected. Two hubs sharing a fixed ``edge-security-hub`` id therefore
+    kick each other in a ~1 s reconnect loop, and since detections are published
+    at QoS 0 the losing side just loses messages, with no error logged anywhere.
+    The symptom is skewed rather than obvious: rules that need two consecutive
+    frames (``line_cross``) fail about half the time while rules that need any
+    single frame (``zone_enter``) keep working.
+
+    Every call returns a different value; the process-wide default is resolved
+    once, by :func:`process_client_id`.
+    """
+    return f"{CLIENT_ID_PREFIX}-{_host_slug()}-{secrets.token_hex(2)}"
+
+
+_PROCESS_CLIENT_ID: str | None = None
+
+
+def process_client_id() -> str:
+    """The default client id for this process — generated once, then stable.
+
+    Stability inside one process matters: :func:`resolve` runs again on every
+    config PUT, and a value that changed each time would report a spurious
+    ``restart_required`` for ``mqtt_client_id``.
+    """
+    global _PROCESS_CLIENT_ID
+    if _PROCESS_CLIENT_ID is None:
+        _PROCESS_CLIENT_ID = default_client_id()
+    return _PROCESS_CLIENT_ID
+
 
 DEFAULTS: dict[str, Any] = {
     "mqtt_host": "localhost",
     "mqtt_port": 1883,
     "mqtt_username": None,
     "mqtt_password": None,
-    "mqtt_client_id": "edge-security-hub",
+    # ``None`` means "derive a unique one" — see :func:`process_client_id`.
+    "mqtt_client_id": None,
     "topic_prefix": "sensecraft/security",
     "http_host": "0.0.0.0",
     "http_port": 8090,
@@ -69,6 +119,10 @@ def resolve(stored: dict[str, Any] | None, env: dict[str, str] | None = None) ->
     cfg = dict(DEFAULTS)
     cfg.update(stored or {})
     cfg.update(env_overrides(env))
+    # An explicit id (config.json or MQTT_CLIENT_ID) always wins; otherwise
+    # every hub process gets its own, so two hubs on one broker cannot collide.
+    if not cfg.get("mqtt_client_id"):
+        cfg["mqtt_client_id"] = process_client_id()
     return cfg
 
 

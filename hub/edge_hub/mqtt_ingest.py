@@ -12,6 +12,7 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable
 
+from .config import default_client_id
 from .validation import ContractValidator
 
 log = logging.getLogger("edge_hub.mqtt")
@@ -29,7 +30,7 @@ class MqttIngest:
         port: int = 1883,
         username: str | None = None,
         password: str | None = None,
-        client_id: str = "edge-security-hub",
+        client_id: str | None = None,
         topic_prefix: str = "sensecraft/security",
         validator: ContractValidator | None = None,
         on_detections: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
@@ -42,7 +43,9 @@ class MqttIngest:
         self.port = port
         self.username = username
         self.password = password
-        self.client_id = client_id
+        # A shared client id makes two hubs disconnect each other in a loop
+        # and silently lose QoS 0 detections (see config.default_client_id).
+        self.client_id = client_id or default_client_id()
         self.topic_prefix = topic_prefix.rstrip("/")
         self.validator = validator or ContractValidator()
         self.on_detections = on_detections
@@ -101,7 +104,8 @@ class MqttIngest:
                     backoff = 1.0
                     for topic in self.subscriptions:
                         await client.subscribe(topic, qos=1)
-                    log.info("mqtt connected to %s:%s", self.host, self.port)
+                    log.info("mqtt connected to %s:%s as client_id=%s",
+                             self.host, self.port, self.client_id)
                     async for message in client.messages:
                         # A handler fault is a message-level problem, not a
                         # transport one. Letting it escape drops the broker
@@ -119,7 +123,8 @@ class MqttIngest:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect on any broker error
-                log.warning("mqtt connection lost: %s", exc)
+                log.warning("mqtt connection lost (client_id=%s): %s",
+                            self.client_id, exc)
             finally:
                 self.connected = False
                 self._client = None

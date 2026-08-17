@@ -162,6 +162,14 @@ class Hub:
     def health(self) -> dict[str, Any]:
         return {
             "ok": True,
+            # Exposed for diagnosis: two hubs on one broker must not share a
+            # client id, or they disconnect each other and drop QoS 0
+            # detections without logging an error.
+            "mqtt_client_id": (
+                self.ingest.client_id
+                if self.ingest
+                else str(self.config["mqtt_client_id"])
+            ),
             "mqtt_connected": bool(self.ingest and self.ingest.connected),
             "mqtt_messages": self.ingest.messages if self.ingest else 0,
             "handler_errors": self.ingest.handler_errors if self.ingest else 0,
