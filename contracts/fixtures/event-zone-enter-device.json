@@ -1,0 +1,20 @@
+{
+  "schema": "sensecraft.event/1",
+  "origin": "device",
+  "timestamp": 1786977946496,
+  "session_id": "1786977934162",
+  "event_id": "generic-01-cam-0-1786977934162-device-1",
+  "device_id": "recamera-02",
+  "stream_id": "cam-0",
+  "event_type": "zone_enter",
+  "rule_name": "loading_bay",
+  "track_id": 4,
+  "bbox": [
+    0.71,
+    0.52,
+    0.13,
+    0.61
+  ],
+  "class": "person",
+  "score": 0.86
+}

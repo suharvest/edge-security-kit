@@ -1,0 +1,27 @@
+{
+  "schema": "sensecraft.status/1",
+  "timestamp": 1786977937956,
+  "session_id": "1786977934162",
+  "device_id": "generic-01",
+  "online": true,
+  "streams": [
+    {
+      "stream_id": "cam-0",
+      "state": "running",
+      "fps": 0.0,
+      "decode": "sw",
+      "preview_url": "http://127.0.0.1:8099/preview/cam-0.jpg"
+    }
+  ],
+  "health": {
+    "fps": 0.0,
+    "decode": "sw",
+    "backend": "onnxruntime-1.28.0-cpu",
+    "fallback_active": false
+  },
+  "versions": {
+    "app": "0.1.0",
+    "model": "yolov8n@fb38b3933007"
+  },
+  "uptime_s": 3.8
+}

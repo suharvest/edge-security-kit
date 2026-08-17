@@ -1,0 +1,21 @@
+{
+  "schema": "sensecraft.event/1",
+  "origin": "hub",
+  "timestamp": 1786977946396,
+  "session_id": "1786977934162",
+  "event_id": "generic-01-cam-0-1786977934162-3",
+  "device_id": "generic-01",
+  "stream_id": "cam-0",
+  "event_type": "loitering",
+  "rule_name": "loading_bay",
+  "track_id": 1,
+  "bbox": [
+    0.75,
+    0.55,
+    0.14,
+    0.65
+  ],
+  "dwell_s": 6.27,
+  "score": 0.9117,
+  "class": "person"
+}

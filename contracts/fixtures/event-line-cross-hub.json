@@ -1,0 +1,21 @@
+{
+  "schema": "sensecraft.event/1",
+  "origin": "hub",
+  "timestamp": 1786977946128,
+  "session_id": "1786977934162",
+  "event_id": "generic-01-cam-0-1786977934162-2",
+  "device_id": "generic-01",
+  "stream_id": "cam-0",
+  "event_type": "line_cross",
+  "rule_name": "gate",
+  "track_id": 1,
+  "bbox": [
+    0.7,
+    0.55,
+    0.14,
+    0.65
+  ],
+  "direction": "forward",
+  "score": 0.9117,
+  "class": "person"
+}
