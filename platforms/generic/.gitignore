@@ -1,0 +1,6 @@
+# The ONNX weights are ~12 MB and fetched by models/README.md instructions.
+models/*.onnx
+# Local deployment config; config.example.yaml is the tracked template.
+config.yaml
+evidence-*.jpg
+!evidence-annotated.jpg

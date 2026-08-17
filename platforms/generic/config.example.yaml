@@ -1,0 +1,38 @@
+# Generic CPU detector configuration. Copy to config.yaml and edit.
+device_id: generic-01
+stream_id: cam-0
+
+# RTSP URL, local file, or numeric camera index as a string.
+source: rtsp://127.0.0.1:8555/edge-sec-720p
+rtsp_transport: tcp
+# The decode path this deployment treats as primary. CPU-only platform -> sw.
+# Set to hw only if you replaced the decoder; the detector then reports
+# health.fallback_active = true whenever it falls back to sw.
+decode_primary: sw
+
+model: models/yolov8n.onnx
+conf_threshold: 0.35
+iou_threshold: 0.45
+# ONNX Runtime intra-op thread cap. Set it. 0 means "onnxruntime default",
+# which is one thread per core for EVERY session on the box: two detectors on a
+# 20-core host each took ~900% CPU, oversubscribed the machine, and inference p50
+# went 50 ms -> 138 ms at 6.2 fps. Budget cores across the detectors you actually
+# run (measured good on spark: 4-6 each, two detectors, 20 cores).
+# The failure this prevents does not look like a performance problem, see README.
+intra_threads: 4
+providers: ["CPUExecutionProvider"]
+
+track_iou_threshold: 0.2
+track_max_lost_s: 0.75
+
+mqtt_host: 127.0.0.1
+mqtt_port: 1883
+topic_prefix: sensecraft/security
+status_interval_s: 30
+
+preview_enabled: true
+preview_bind: 0.0.0.0
+preview_port: 8099
+# Host the hub frontend should use to reach the preview endpoint. Left empty,
+# status.streams[].preview_url is omitted rather than advertised wrongly.
+preview_advertise_host: ""
