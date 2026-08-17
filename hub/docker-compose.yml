@@ -1,0 +1,24 @@
+# HUB_SPEC §8 deployment form. Build context is the repo root:
+#   docker compose -f hub/docker-compose.yml --project-directory . up -d
+services:
+  hub:
+    image: sensecraft-missionpack.seeed.cn/solution/edge-security-hub:${HUB_TAG:-dev}
+    build:
+      context: .
+      dockerfile: hub/Dockerfile
+    restart: unless-stopped
+    ports: ["8090:8090"]
+    volumes: ["./data:/data"]
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      # Set once on first boot; otherwise the account is created as admin/admin
+      # with must_change=1 and the credential is printed to the container log.
+      HUB_ADMIN_PASSWORD: ${HUB_ADMIN_PASSWORD:-}
+    depends_on: [mosquitto]
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports: ["1883:1883"]
+    volumes: ["./mosquitto:/mosquitto/config:ro"]
