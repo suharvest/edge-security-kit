@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seeed.studio/schemas/edge-security/mqtt-detection-v1.json",
+  "title": "Cross-platform edge-security MQTT messages v1",
+  "description": "Top-level schema for the three message kinds published by edge-security detectors and the hub: sensecraft.detection/1, sensecraft.status/1, sensecraft.event/1. A payload must match exactly one branch, discriminated by its `schema` field.",
+  "oneOf": [
+    {"$ref": "#/$defs/detection_message"},
+    {"$ref": "#/$defs/status_message"},
+    {"$ref": "#/$defs/event_message"}
+  ],
+  "$defs": {
+    "bbox_norm": {
+      "type": "array",
+      "items": {"type": "number", "minimum": 0, "maximum": 1},
+      "minItems": 4,
+      "maxItems": 4,
+      "description": "Normalized [center_x, center_y, width, height] in the ORIGINAL frame space (frame_norm). Senders must reverse any letterbox/pad transform before normalizing; letterboxed coordinates must never leave the device."
+    },
+    "decode_path": {
+      "enum": ["hw", "sw"],
+      "description": "Active video decode path. hw = platform hardware decoder (NVDEC / MPP / Hailo pipeline / CVI). sw = CPU fallback (ffmpeg/libav). A silent fallback to sw must still be reported here."
+    },
+    "health": {
+      "type": "object",
+      "required": ["fps", "decode", "backend", "fallback_active"],
+      "properties": {
+        "fps": {"type": "number", "minimum": 0, "description": "Measured end-to-end per-stream processing rate over the reporting window, frames per second"},
+        "decode": {"$ref": "#/$defs/decode_path"},
+        "backend": {"type": "string", "minLength": 1, "description": "Inference backend identifier, e.g. tensorrt-10.3, rknn-lite2, hailort-4.x, cvimodel"},
+        "fallback_active": {"type": "boolean", "description": "true when any configured-primary path (decode or inference) is currently running on its fallback"}
+      },
+      "additionalProperties": true
+    },
+    "detection": {
+      "type": "object",
+      "required": ["track_id", "class", "score", "bbox"],
+      "properties": {
+        "track_id": {"type": "integer", "minimum": 0, "description": "Stable per-stream track ID, >= 1. 0 is reserved for detections not associated with a track"},
+        "class": {"type": "string", "minLength": 1, "description": "Detected class label. v1 detectors emit 'person'; the field is a string so future classes need no schema change"},
+        "score": {"type": "number", "minimum": 0, "maximum": 1, "description": "Detector confidence after NMS"},
+        "bbox": {"$ref": "#/$defs/bbox_norm"}
+      },
+      "additionalProperties": true
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Generated once per detector process start (boot epoch ms or uuid recommended). A new value tells consumers that frame_id, track_id and event sequence counters have reset; the hub drops all per-track rule state for the device on seeing it change"
+    },
+    "detection_message": {
+      "type": "object",
+      "required": [
+        "schema", "timestamp", "session_id", "frame_id", "device_id", "stream_id",
+        "coordinate_space", "frame", "inference_time_ms", "detections", "health"
+      ],
+      "properties": {
+        "schema": {"const": "sensecraft.detection/1"},
+        "timestamp": {"type": "integer", "minimum": 0, "description": "Unix epoch milliseconds. Never monotonic seconds or a float"},
+        "session_id": {"$ref": "#/$defs/session_id"},
+        "frame_id": {"type": "integer", "minimum": 0, "description": "Monotonically increasing per stream within one session_id"},
+        "device_id": {"type": "string", "minLength": 1, "description": "Stable configured device ID; must match the topic segment"},
+        "stream_id": {"type": "string", "minLength": 1, "description": "Stable configured source ID; required in the payload so consumers do not depend on topic parsing"},
+        "coordinate_space": {"const": "frame_norm", "description": "The only permitted value. Senders normalize against the original frame after reversing letterbox"},
+        "frame": {
+          "type": "object",
+          "required": ["w", "h"],
+          "properties": {
+            "w": {"type": "integer", "minimum": 1, "description": "Original frame width in pixels, before any model-input resize"},
+            "h": {"type": "integer", "minimum": 1, "description": "Original frame height in pixels"}
+          },
+          "additionalProperties": false
+        },
+        "inference_time_ms": {"type": "number", "minimum": 0, "description": "Accelerator inference call only, where the API exposes it. If a backend can measure only a larger region, publish that separately as pipeline_ms and document the fact"},
+        "pipeline_ms": {"type": "number", "minimum": 0, "description": "Optional: capture-to-publish latency for this frame"},
+        "detections": {"type": "array", "items": {"$ref": "#/$defs/detection"}},
+        "health": {"$ref": "#/$defs/health"}
+      },
+      "additionalProperties": true
+    },
+    "stream_status": {
+      "type": "object",
+      "required": ["stream_id", "state"],
+      "properties": {
+        "stream_id": {"type": "string", "minLength": 1},
+        "state": {"enum": ["running", "reconnecting", "stopped"], "description": "reconnecting = source lost, retry loop active; stopped = disabled by configuration"},
+        "fps": {"type": "number", "minimum": 0},
+        "decode": {"$ref": "#/$defs/decode_path"},
+        "preview_url": {"type": "string", "description": "Optional: device-local HTTP endpoint returning a current single-frame JPEG for this stream; used by the hub rule-canvas as backdrop (fetched browser-side, device must allow CORS GET)"},
+        "live_url": {"type": "string", "description": "Optional: device-local page or stream URL for live viewing; the hub links to it and never proxies video"}
+      },
+      "additionalProperties": true
+    },
+    "status_message": {
+      "type": "object",
+      "required": ["schema", "timestamp", "session_id", "device_id", "online"],
+      "properties": {
+        "schema": {"const": "sensecraft.status/1"},
+        "timestamp": {"type": "integer", "minimum": 0, "description": "Unix epoch milliseconds at publish time. For the LWT payload this is the CONNECT time (brokers deliver LWT verbatim); consumers should use broker receipt time as the offline instant"},
+        "session_id": {"$ref": "#/$defs/session_id"},
+        "device_id": {"type": "string", "minLength": 1},
+        "online": {"type": "boolean", "description": "false only in the LWT payload registered at connect"},
+        "streams": {"type": "array", "items": {"$ref": "#/$defs/stream_status"}, "description": "Omitted in the LWT payload"},
+        "versions": {
+          "type": "object",
+          "properties": {
+            "app": {"type": "string"},
+            "model": {"type": "string", "description": "Model artifact identifier, e.g. file stem plus hash prefix"}
+          },
+          "additionalProperties": true
+        },
+        "uptime_s": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "event_message": {
+      "type": "object",
+      "required": [
+        "schema", "timestamp", "session_id", "event_id", "device_id", "stream_id",
+        "event_type", "rule_name", "track_id", "bbox"
+      ],
+      "properties": {
+        "schema": {"const": "sensecraft.event/1"},
+        "timestamp": {"type": "integer", "minimum": 0, "description": "Unix epoch milliseconds"},
+        "session_id": {"$ref": "#/$defs/session_id"},
+        "event_id": {"type": "string", "minLength": 1, "description": "Globally unique within the publishing rule engine, recommended <device_id>-<stream_id>-<session_id>-<seq> so restarts cannot collide. Used as the snapshot topic segment"},
+        "device_id": {"type": "string", "minLength": 1},
+        "stream_id": {"type": "string", "minLength": 1},
+        "event_type": {"enum": ["zone_enter", "loitering", "line_cross"]},
+        "rule_name": {"type": "string", "minLength": 1, "description": "Name of the zone or line that fired"},
+        "track_id": {"type": "integer", "minimum": 0},
+        "bbox": {"$ref": "#/$defs/bbox_norm"},
+        "direction": {"enum": ["forward", "backward"], "description": "line_cross only. forward = crossing from the left side to the right side of the directed line start->end (see MQTT.md for the sign convention)"},
+        "dwell_s": {"type": "number", "minimum": 0, "description": "loitering only: seconds inside the zone when the event fired"},
+        "snapshot_ref": {"type": "string", "description": "Present when a snapshot exists: the snapshot topic suffix or hub storage path"},
+        "class": {"type": "string", "minLength": 1},
+        "score": {"type": "number", "minimum": 0, "maximum": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"event_type": {"const": "line_cross"}}},
+          "then": {"required": ["direction"]}
+        },
+        {
+          "if": {"properties": {"event_type": {"const": "loitering"}}},
+          "then": {"required": ["dwell_s"]}
+        }
+      ],
+      "additionalProperties": true
+    }
+  }
+}
