@@ -55,50 +55,55 @@ const devices = [
     name: 'Gate A · Jetson Orin',
     online: true,
     mode: 'hub',
-    version: '0.2.0',
+    versions: { app: '0.2.0', model: 'yolov8n@fb38b3933007' },
     last_seen_ms: Date.now(),
-    streams: {
-      'cam-01': {
+    // contracts/mqtt-detection.schema.json: `streams` is an ARRAY of stream_status
+    // objects, each carrying its own stream_id. The hub passes it through as-is.
+    streams: [
+      {
+        stream_id: 'cam-01',
         state: 'running', decode: 'hw', fps: 14.8, fallback_active: false,
         frame: { w: 1920, h: 1080 },
         preview_url: '/mock/preview-1920x1080.jpg',
         live_url: 'http://192.168.3.31:8080/live/cam-01',
       },
       // 4:3 source on a 16:9 canvas: proves the object-fit: contain math (§4.1).
-      'cam-02': {
+      {
+        stream_id: 'cam-02',
         state: 'running', decode: 'hw', fps: 13.2, fallback_active: false,
         frame: { w: 1280, h: 960 },
         preview_url: '/mock/preview-1280x960.jpg',
         live_url: 'http://192.168.3.31:8080/live/cam-02',
       },
-    },
+    ],
   },
   {
     device_id: 'rk3588-02',
     name: 'Dock · RK3588',
     online: true,
     mode: 'hub',
-    version: '0.2.0',
+    versions: { app: '0.2.0', model: 'yolov8n@fb38b3933007' },
     last_seen_ms: Date.now(),
-    streams: {
+    streams: [
       // No preview_url -> grey canvas fallback + /api/live overlay.
-      'cam-01': {
+      {
+        stream_id: 'cam-01',
         state: 'running', decode: 'sw', fps: 6.2, fallback_active: true,
         frame: { w: 2560, h: 1440 },
         live_url: 'http://192.168.3.42:8080/live/cam-01',
       },
-    },
+    ],
   },
   {
     device_id: 'recamera-07',
     name: 'Side door · reCamera',
     online: false,
     mode: 'single_box',
-    version: '0.1.9',
+    versions: { app: '0.1.9', model: 'yolo11n@0c31a7d19f42' },
     last_seen_ms: Date.now() - 52 * 60 * 1000,
-    streams: {
-      'cam-01': { state: 'stopped', decode: 'hw', fps: 0, frame: { w: 1920, h: 1080 } },
-    },
+    streams: [
+      { stream_id: 'cam-01', state: 'stopped', decode: 'hw', fps: 0, frame: { w: 1920, h: 1080 } },
+    ],
   },
 ];
 
@@ -128,6 +133,12 @@ const hubConfig = { mqtt_host: 'mosquitto', mqtt_port: 1883, retention_days: 30,
 
 let alertSeq = 0;
 const alerts = [];
+
+// `streams` is an array; look one up by its own stream_id (never by index).
+function streamOf(dev, sid) {
+  return (dev && dev.streams || []).find((x) => String(x.stream_id) === String(sid)) || null;
+}
+function streamIdsOf(dev) { return (dev && dev.streams || []).map((x) => String(x.stream_id)); }
 
 function ruleNamesFor(d, s) { return (RULES[d] && RULES[d][s]) || ['rule']; }
 
@@ -478,6 +489,22 @@ async function api(req, res, u) {
 
   if (p === '/devices' && method === 'GET') return send(res, 200, { devices });
 
+  // Hub single-frame preview proxy (HUB_SPEC §4). The mock serves the same
+  // fixture JPEG the device would, so the rule canvas exercises the real path.
+  m = /^\/devices\/([^/]+)\/streams\/([^/]+)\/preview\.jpg$/.exec(p);
+  if (m && method === 'GET') {
+    const dev = devices.find((d) => d.device_id === decodeURIComponent(m[1]));
+    if (!dev) return send(res, 404, { error: 'device not found' });
+    const stream = streamOf(dev, decodeURIComponent(m[2]));
+    if (!stream) return send(res, 404, { error: 'stream not found' });
+    if (!stream.preview_url) return send(res, 404, { error: 'stream reports no preview_url' });
+    const file = path.join(MOCKDIR, stream.preview_url.replace('/mock/', ''));
+    if (!file.startsWith(MOCKDIR) || !fs.existsSync(file)) {
+      return send(res, 502, { error: 'device unreachable (mock)', preview_url: stream.preview_url });
+    }
+    return serveFile(res, file);
+  }
+
   m = /^\/devices\/([^/]+)\/config$/.exec(p);
   if (m) {
     const id = decodeURIComponent(m[1]);
@@ -485,9 +512,9 @@ async function api(req, res, u) {
     if (!dev) return send(res, 404, { error: 'no such device' });
     if (method === 'GET') {
       const streams = {};
-      Object.keys(dev.streams).forEach((s) => {
+      streamIdsOf(dev).forEach((s) => {
         streams[s] = {
-          camera: { rtsp_url: 'rtsp://192.168.3.90:554/' + s, frame: dev.streams[s].frame },
+          camera: { rtsp_url: 'rtsp://192.168.3.90:554/' + s, frame: (streamOf(dev, s) || {}).frame },
           rules: ((rules[id] || {})[s] || { body: { zones: [], lines: [], features: {}, cooldown: 30 } }).body,
         };
       });
@@ -561,7 +588,7 @@ async function api(req, res, u) {
     const d = decodeURIComponent(m[1]);
     const s = decodeURIComponent(m[2]);
     const dev = devices.find((x) => x.device_id === d);
-    const stream = dev && dev.streams[s];
+    const stream = streamOf(dev, s);
     if (!stream) return send(res, 404, { error: 'no such stream' });
     const n = 1 + Math.floor(Math.random() * 3);
     const objects = [];
@@ -616,16 +643,17 @@ function mock(req, res, u) {
     if (!dev) return send(res, 404, { error: 'no such device' });
     dev.online = p === '/mock/online';
     dev.last_seen_ms = Date.now();
-    if (!dev.online) Object.keys(dev.streams).forEach((s) => { dev.streams[s].fps = 0; dev.streams[s].state = 'stopped'; });
+    if (!dev.online) dev.streams.forEach((st) => { st.fps = 0; st.state = 'stopped'; });
     push({ type: 'device.status', device: { device_id: dev.device_id, online: dev.online, last_seen_ms: dev.last_seen_ms, streams: dev.streams } });
     log('device', dev.device_id, dev.online ? 'online' : 'offline');
     return send(res, 200, { ok: true, online: dev.online });
   }
   if (p === '/mock/decode') {
     const dev = devices.find((d) => d.device_id === q.device);
-    if (!dev || !dev.streams[q.stream]) return send(res, 404, { error: 'no such stream' });
-    dev.streams[q.stream].decode = q.decode === 'sw' ? 'sw' : 'hw';
-    dev.streams[q.stream].fallback_active = q.decode === 'sw';
+    const target = streamOf(dev, q.stream);
+    if (!target) return send(res, 404, { error: 'no such stream' });
+    target.decode = q.decode === 'sw' ? 'sw' : 'hw';
+    target.fallback_active = q.decode === 'sw';
     push({ type: 'device.status', device: { device_id: dev.device_id, online: dev.online, streams: dev.streams } });
     return send(res, 200, { ok: true });
   }
@@ -682,8 +710,7 @@ setInterval(() => {
   let changed = false;
   devices.forEach((d) => {
     if (!d.online) return;
-    Object.keys(d.streams).forEach((s) => {
-      const st = d.streams[s];
+    d.streams.forEach((st) => {
       if (!st.fps) return;
       const base = st.decode === 'sw' ? 6.2 : 14.2;
       st.fps = Number((base + (Math.random() - 0.5) * 1.6).toFixed(1));

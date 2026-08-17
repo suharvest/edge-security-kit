@@ -92,3 +92,25 @@ export function errMsg(e) {
   if (e.network) return t('conn.offline');
   return e.message || t('common.error');
 }
+
+// ---- device streams ----------------------------------------------------------
+// `status.streams` is an ARRAY of stream_status objects (contracts/mqtt-detection
+// .schema.json §stream_status), and the hub passes it through verbatim
+// (device_registry.py). Treating it as an object keyed by stream id yields array
+// indices ("0", "1", ...) as stream ids, which silently writes rules to a stream
+// named "0". Every consumer goes through these helpers.
+export function streamList(device) {
+  const s = (device && device.streams) || [];
+  if (Array.isArray(s)) return s.filter((x) => x && x.stream_id != null);
+  // A legacy object map degrades instead of breaking: synthesize stream_id from the key.
+  return Object.keys(s).map((k) => Object.assign({ stream_id: k }, s[k] || {}));
+}
+
+export function streamIds(device) {
+  return streamList(device).map((s) => String(s.stream_id));
+}
+
+export function findStream(device, streamId) {
+  if (streamId === null || streamId === undefined || streamId === '') return null;
+  return streamList(device).find((s) => String(s.stream_id) === String(streamId)) || null;
+}

@@ -83,7 +83,7 @@ class Detector:
                 self.store, cfg.stream_id, cfg.preview_bind, cfg.preview_port
             )
             LOG.info(
-                "preview endpoint on http://%s:%d/preview.jpg",
+                "preview endpoint on http://%s:%d/preview.jpg (live page at /live)",
                 cfg.preview_bind,
                 cfg.preview_port,
             )
@@ -194,10 +194,13 @@ class Detector:
                 "decode": self.decode_path,
             }
             if self.cfg.preview_enabled and self.cfg.preview_advertise_host:
-                stream["preview_url"] = (
+                base = (
                     f"http://{self.cfg.preview_advertise_host}:{self.cfg.preview_port}"
-                    f"/preview/{self.cfg.stream_id}.jpg"
                 )
+                stream["preview_url"] = f"{base}/preview/{self.cfg.stream_id}.jpg"
+                # The refreshing-still page served by the same server. Without it
+                # the workbench "live view" button has no target and stays dead.
+                stream["live_url"] = f"{base}/live/{self.cfg.stream_id}"
             payload["streams"] = [stream]
             payload["health"] = self.health()
             payload["versions"] = {"app": self.cfg.app_version, "model": self.model_id}

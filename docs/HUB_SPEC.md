@@ -187,6 +187,7 @@ device_registry 会另行标记）；晚到快照仍按 §3 状态机关联。�
 | POST | /rules/{device_id}/{stream_id}/simulate | 入参 `{rule_id}`；构造 `meta.simulated=true` 的告警走完整链路（入库、WS 推送），供画完规则后自测。**绕过冷却**（自测不该被上一条真实告警挡住），且**不发 cmd/snapshot**（没有对应真实帧），落库即 `snapshot_state=none` |
 | GET | /devices/{device_id}/config | 该设备全部流的规则+摄像头配置 JSON 导出（备份下载） |
 | PUT | /devices/{device_id}/config | 恢复上传，同 /rules 校验与持久化语义，rev 照常自增。**仅恢复规则**：契约没有摄像头配置的下行通道，导出体里的 `camera` 块是信息性的，恢复时不会推回设备（列入未来项，需要新增 `cmd/config` 下行才能闭环） |
+| GET | /devices/{device_id}/streams/{stream_id}/preview.jpg | **单帧预览代理**。设备的 `preview_url` 是设备本地地址（`http://127.0.0.1:8099/...`），远端浏览器取不到；hub 服务端去拉一帧 JPEG 回传，缓存 1.5 s（超时 2 s）。设备不可达 / 非 200 / 返回体不是 JPEG，一律 502 + `{"error": "...", "preview_url": "..."}`，不静默降级成灰底。流未上报 `preview_url` 时 404 |
 | GET | /live/{device_id}/{stream_id} | 该流最近一条 detections（内存态），供前端画规则时叠加参考框；无视频代理 |
 | GET | /config | hub 自身配置（broker 地址、留存天数等） |
 | PUT | /config | 同上；重启生效项在响应中列出 |
@@ -194,6 +195,11 @@ device_registry 会另行标记）；晚到快照仍按 §3 状态机关联。�
 | GET | /auth/session | 当前会话的用户名与 `must_change`；前端据此决定是否强制跳改密页 |
 | POST | /auth/logout | 作废当前会话 |
 | POST | /auth/password | 修改唯一账户密码，入参旧密+新密；成功后其余会话作废 |
+
+**单帧预览代理 ≠ 视频流聚合**（§11 边界的澄清）：该端点每次请求最多向设备取
+一帧 JPEG，不保持连接、不转码、不做多路复用，缓存窗口内 N 个操作员合并成对设备的
+一次请求。它替代的是浏览器直连设备本地地址这件本来就做不到的事，不是 RTSP/HLS
+中继。视频观看仍然跳设备自己的 `live_url`。
 
 **配置持久化语义**（修复旧版内存态丢失问题的核心条款）：
 - 写盘时机：每次 PUT 成功即写，无延迟批处理。
@@ -284,6 +290,14 @@ CREATE TABLE auth (
   password_hash TEXT NOT NULL,             -- bcrypt
   must_change   INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TABLE sessions (                    -- §7：会话跨 hub 重启保持有效
+  token       TEXT PRIMARY KEY,            -- cookie 里的值即主键
+  username    TEXT NOT NULL,
+  created_ms  INTEGER NOT NULL,
+  expires_ms  INTEGER NOT NULL             -- 滑动空闲截止，每次使用后推
+);
+CREATE INDEX idx_sessions_expiry ON sessions(expires_ms);
 ```
 
 留存策略：alerts 与快照默认保留 30 天（可配），每日定时清理；快照目录
@@ -301,8 +315,14 @@ CREATE TABLE auth (
   - 否则随机生成 ≥16 字符的密码，同时写入容器日志（WARNING 级）与
     `<data_dir>/initial-password.txt`（权限 0600，供漏看启动输出的运维读取）。
 
-  两种情况都置 `must_change=1`，前端强制改密后才放行其余页面。会话服务端存储
-  （内存 + 重启失效即可），空闲过期默认 7 天。
+  两种情况都置 `must_change=1`，前端强制改密后才放行其余页面。
+- **会话持久化**：会话服务端存储，落在同一份 SQLite 的 `sessions` 表
+  （`token` 主键 + `created_ms` + `expires_ms`），**hub 重启后未过期的会话继续
+  有效**。升级、崩溃重启、断电恢复都不该把当班的人踢出登录页。`expires_ms` 是
+  滑动空闲截止时间，每次使用向后推，默认空闲过期 7 天；过期行在命中时删除，
+  进程启动时统一清扫一次，所以没被清扫到的过期行也不会放行。
+  `POST /auth/logout` 删除该行；改密删除除当前会话外的全部行（§4）——这两条
+  语义同样跨重启保持。
 - 传输安全：LAN 场景 v1 不内置 TLS；对外暴露时前置反向代理终结 TLS（文档注明）。
 - MQTT broker：单机模式 mosquitto 只监听 127.0.0.1 可匿名；hub 模式监听 LAN
   必须启用账号（v1 全体探测设备共享一组凭据，per-device 凭据列入 v2）。
@@ -362,6 +382,12 @@ RSS < 300 MB、SQLite 写放大可忽略（仅事件落库）。镜像目标 < 1
 不聚合视频流（点开告警跳设备本地流）、无录像时间轴/NVR 存储管理、无 PTZ、
 无电子地图、无多租户/角色树、无工单流转、无人脸/车牌检索。detections 不落库、
 不回放。以上任何一项的需求出现时，答案是对接第三方 VMS，不是在 hub 里长出来。
+
+**"不聚合视频流"的边界**：`GET /devices/{id}/streams/{sid}/preview.jpg`（§4）
+是单帧 JPEG 代理，不在此列。区分标准是连接数与时序：视频聚合意味着 hub 为每路流
+维持长连接、按帧率持续拉取并向前端扇出；单帧代理是一次请求取一帧、带缓存、无状态。
+前者让 hub 的资源占用随流数和观看人数增长，后者不会。禁止在此基础上加 MJPEG
+multipart、HLS 切片、WebRTC 转发或任何"顺手做成连续的"变体。
 
 **无批量删除端点**：没有 `DELETE /alerts`、没有"清空全部事件"。告警是取证记录，
 清理由 §6 的留存策略按天自动做；一个能一次抹掉全部证据的端点，对合法用户省下

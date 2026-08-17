@@ -8,7 +8,7 @@ import { useStore, commit, toast } from '../store.js';
 import { setQuery } from '../router.js';
 import { Icon } from '../icons.js';
 import { Field, Select, Confirm, Spinner } from '../components/ui.js';
-import { clockTime, uid, errMsg } from '../util.js';
+import { clockTime, uid, errMsg, streamIds, findStream } from '../util.js';
 import {
   computeFit, normToCanvas, canvasToNorm, eventToCanvas, forwardNormal, midpoint,
   distToSegment, pointInPolygon, isSelfIntersecting, polygonCentroid, bboxToRect, clamp01,
@@ -92,14 +92,14 @@ function ArrowGlyph({ a, b, direction }) {
   return draw(direction === 'forward' ? 1 : -1, 'one');
 }
 
-function RuleCanvas({ body, setBody, frame, previewUrl, live, showLive, tool, setTool, sel, setSel, issueIds }) {
+function RuleCanvas({ body, setBody, frame, previewSources, live, showLive, tool, setTool, sel, setSel, issueIds }) {
   const wrapRef = useRef(null);
   const svgRef = useRef(null);
   const [size, setSize] = useState({ w: 640, h: 360 });
   const [draftZone, setDraftZone] = useState([]);
   const [draftLine, setDraftLine] = useState(null);
   const [hoverNorm, setHoverNorm] = useState(null);
-  const [previewOk, setPreviewOk] = useState(false);
+  const [previewSrc, setPreviewSrc] = useState(null);
   const drag = useRef(null);
   const [pendingDelete, setPendingDelete] = useState(null);
 
@@ -114,18 +114,29 @@ function RuleCanvas({ body, setBody, frame, previewUrl, live, showLive, tool, se
     return () => { if (ro) ro.disconnect(); window.removeEventListener('resize', measure); };
   }, []);
 
-  // Probe the device preview endpoint before using it as the backdrop; a device that
-  // is unreachable or refuses cross-origin GET degrades to the grey canvas (§2.3).
+  // §2.3 backdrop sourcing. Candidates are tried in order and the first that
+  // decodes wins: the hub's same-origin single-frame proxy first (it works from
+  // anywhere the UI works), the device's own preview_url only as an optimisation
+  // for a browser that happens to sit on the device network. All candidates
+  // failing degrades to the grey canvas, which is still fully drawable.
+  const sources = (previewSources || []).filter(Boolean);
+  const sourceKey = sources.join('|');
   useEffect(() => {
-    setPreviewOk(false);
-    if (!previewUrl) return;
+    setPreviewSrc(null);
+    if (!sources.length) return;
     let dead = false;
+    let index = 0;
     const img = new Image();
-    img.onload = () => { if (!dead) setPreviewOk(true); };
-    img.onerror = () => { if (!dead) setPreviewOk(false); };
-    img.src = previewUrl;
+    const attempt = () => {
+      if (dead || index >= sources.length) return;
+      img.src = sources[index];
+    };
+    img.onload = () => { if (!dead) setPreviewSrc(sources[index]); };
+    img.onerror = () => { index += 1; attempt(); };
+    attempt();
     return () => { dead = true; img.onload = null; img.onerror = null; };
-  }, [previewUrl]);
+  }, [sourceKey]);
+  const previewOk = !!previewSrc;
 
   const fit = useMemo(() => computeFit(size.w, size.h, frame.w, frame.h), [size, frame.w, frame.h]);
   const toC = (n) => normToCanvas(n, fit);
@@ -299,7 +310,7 @@ function RuleCanvas({ body, setBody, frame, previewUrl, live, showLive, tool, se
              onDblClick=${onDblClick}>
           <rect x="0" y="0" width=${size.w} height=${size.h} class="canvas-bg" />
           ${previewOk
-            ? html`<image href=${previewUrl} x=${fit.offsetX} y=${fit.offsetY} width=${fit.dispW} height=${fit.dispH}
+            ? html`<image href=${previewSrc} x=${fit.offsetX} y=${fit.offsetY} width=${fit.dispW} height=${fit.dispH}
                           preserveAspectRatio="none" />`
             : html`<rect x=${fit.offsetX} y=${fit.offsetY} width=${fit.dispW} height=${fit.dispH} class="canvas-frame" />`}
 
@@ -360,7 +371,7 @@ function RuleCanvas({ body, setBody, frame, previewUrl, live, showLive, tool, se
 
         ${!previewOk ? html`
           <div class="canvas-note">
-            ${previewUrl ? t('rules.canvas.previewFail') : t('rules.canvas.noPreview', { w: frame.w, h: frame.h })}
+            ${sources.length ? t('rules.canvas.previewFail') : t('rules.canvas.noPreview', { w: frame.w, h: frame.h })}
           </div>` : null}
         ${hoverNorm ? html`<div class="canvas-coord mono">${hoverNorm[0].toFixed(3)}, ${hoverNorm[1].toFixed(3)}</div>` : null}
       </div>
@@ -508,8 +519,8 @@ export function RulesPage() {
   }, []);
 
   const dev = devices.find((d) => d.device_id === deviceId) || null;
-  const streamIds = dev ? Object.keys(dev.streams || {}) : [];
-  const stream = dev && streamId ? (dev.streams || {})[streamId] : null;
+  const sids = dev ? streamIds(dev) : [];
+  const stream = findStream(dev, streamId);
 
   const frame = useMemo(() => {
     const f = (stream && stream.frame) || (live && live.frame) || null;
@@ -517,7 +528,11 @@ export function RulesPage() {
     return FALLBACK_FRAME;
   }, [stream, live]);
 
-  const previewUrl = (stream && stream.preview_url) || null;
+  // Hub proxy first, the device-local URL as an opportunistic upgrade (§2.3).
+  const previewSources = useMemo(() => {
+    if (!deviceId || !streamId) return [];
+    return [api.streamPreviewUrl(deviceId, streamId), (stream && stream.preview_url) || null].filter(Boolean);
+  }, [deviceId, streamId, stream && stream.preview_url]);
 
   // Load rules for the selected stream.
   useEffect(() => {
@@ -638,7 +653,7 @@ export function RulesPage() {
         <//>
         <${Field} label=${t('rules.pickStream')}>
           <${Select} value=${streamId} onChange=${(v) => pick({ stream_id: v })}
-            options=${[{ value: '', label: '—' }].concat(streamIds.map((s) => ({ value: s, label: s })))} />
+            options=${[{ value: '', label: '—' }].concat(sids.map((s) => ({ value: s, label: s })))} />
         <//>
         <label class="inline live-toggle">
           <input type="checkbox" checked=${showLive} onChange=${(e) => setShowLive(e.target.checked)} />
@@ -657,7 +672,7 @@ export function RulesPage() {
         : loading ? html`<${Spinner} />`
           : html`
             <div class="rules-body">
-              <${RuleCanvas} body=${body} setBody=${setBody} frame=${frame} previewUrl=${previewUrl}
+              <${RuleCanvas} body=${body} setBody=${setBody} frame=${frame} previewSources=${previewSources}
                 live=${live} showLive=${showLive} tool=${tool} setTool=${setTool}
                 sel=${sel} setSel=${setSel} issueIds=${issueIds} />
               <${RuleSidebar} body=${body} setBody=${setBody} sel=${sel} setSel=${setSel}

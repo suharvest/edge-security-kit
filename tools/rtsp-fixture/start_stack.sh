@@ -8,10 +8,14 @@ ESK_ROOT=${ESK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 FIX=${ESK_FIXTURE_DIR:-$HOME/edge-security-fixture}
 GEN=${ESK_GENERIC_DIR:-$ESK_ROOT/platforms/generic}
 HUB=${ESK_HUB_DIR:-$ESK_ROOT/hub}
+# The built frontend. /nonexistent here means the hub serves only its placeholder
+# page, so a stack restarted per the README came up with no UI at all.
+WEB=${ESK_HUB_WEB_DIR:-$ESK_ROOT/web/dist}
 DATA=${ESK_HUB_DATA:-$HOME/edge-security-hub-data}
 LOGS=$FIX/e2e-logs
 
 mkdir -p "$DATA" "$LOGS"
+[ -d "$WEB" ] || echo "WARNING: no frontend at $WEB -- the hub will serve its placeholder page" >&2
 
 echo "== stopping any previous run of THIS stack"
 pkill -f "edge_hub --data-dir $DATA" && echo "  hub stopped"
@@ -71,7 +75,7 @@ EOF
 echo "== starting hub on :18080"
 cd "$HUB"
 MQTT_HOST=127.0.0.1 MQTT_PORT=1884 HUB_HTTP_PORT=18080 \
-  HUB_ADMIN_PASSWORD='e2e-truth-run-2026' HUB_WEB_DIR=/nonexistent \
+  HUB_ADMIN_PASSWORD='e2e-truth-run-2026' HUB_WEB_DIR="$WEB" \
   setsid nohup uv run python -m edge_hub --data-dir "$DATA" \
   > "$LOGS/hub.log" 2>&1 < /dev/null &
 sleep 8

@@ -6,6 +6,7 @@ ESK_ROOT=${ESK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 FIX=${ESK_FIXTURE_DIR:-$HOME/edge-security-fixture}
 GEN=${ESK_GENERIC_DIR:-$ESK_ROOT/platforms/generic}
 HUB=${ESK_HUB_DIR:-$ESK_ROOT/hub}
+WEB=${ESK_HUB_WEB_DIR:-$ESK_ROOT/web/dist}
 DATA=${ESK_HUB_DATA:-$HOME/edge-security-hub-data}
 LOGS=$FIX/e2e-logs
 C="$FIX/e2e-out/cookies.txt"
@@ -24,18 +25,27 @@ pkill -f "edge_hub --data-dir $DATA"
 sleep 3
 cd "$HUB"
 MQTT_HOST=127.0.0.1 MQTT_PORT=1884 HUB_HTTP_PORT=18080 \
-  HUB_ADMIN_PASSWORD='e2e-truth-run-2026' HUB_WEB_DIR=/nonexistent \
+  HUB_ADMIN_PASSWORD='e2e-truth-run-2026' HUB_WEB_DIR="$WEB" \
   setsid nohup uv run python -m edge_hub --data-dir "$DATA" \
   >> "$LOGS/hub.log" 2>&1 < /dev/null &
 sleep 12
 tail -4 "$LOGS/hub.log"
 
 echo
-echo "===== AFTER restart: login again (sessions are in-memory by design) ====="
-rm -f "$C"
-curl -sS -c "$C" -X POST -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"e2e-truth-run-2026"}' \
-  http://127.0.0.1:18080/api/auth/login; echo
+echo "===== AFTER restart: the pre-restart cookie must still work (HUB_SPEC §7) ====="
+# Sessions live in the sessions table, not in process memory: the same cookie file
+# from before the restart has to be accepted. A 401 here is a regression.
+code=$(curl -sS -o /dev/null -w '%{http_code}' -b "$C" http://127.0.0.1:18080/api/auth/session)
+echo "GET /api/auth/session with the pre-restart cookie -> HTTP $code"
+if [ "$code" = "200" ]; then
+  curl -sS -b "$C" http://127.0.0.1:18080/api/auth/session; echo
+else
+  echo "SESSION DID NOT SURVIVE THE RESTART -- logging in again to continue" >&2
+  rm -f "$C"
+  curl -sS -c "$C" -X POST -H 'Content-Type: application/json' \
+    -d '{"username":"admin","password":"e2e-truth-run-2026"}' \
+    http://127.0.0.1:18080/api/auth/login; echo
+fi
 
 echo
 echo "===== alerts survived? ====="

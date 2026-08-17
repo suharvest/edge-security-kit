@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 from aiohttp import WSMsgType, web
 
 from .auth import COOKIE_NAME, Session
@@ -23,6 +24,15 @@ from .rules_schema import RulesError, find_rule, validate_rules_body
 log = logging.getLogger("edge_hub.http")
 
 MAX_BATCH = 500
+#: §4 single-frame preview proxy. A device preview_url is a device-LOCAL address
+#: (http://127.0.0.1:8099/...), so a browser on another host can never fetch it.
+#: The hub fetches one JPEG server-side and caches it briefly. This is a still
+#: frame on demand, not a video stream: no continuous pull, no fan-out, no
+#: transcode, and the cache collapses N operators to one device request per
+#: window. See HUB_SPEC §4 and the "not doing" list.
+PREVIEW_TIMEOUT_S = 2.0
+PREVIEW_CACHE_MS = 1500
+PREVIEW_MAX_BYTES = 4 * 1024 * 1024
 #: typed request key holding the authenticated session
 SESSION_KEY: "web.RequestKey[Session]" = web.RequestKey("session")
 PLACEHOLDER_HTML = """<!doctype html>
@@ -93,6 +103,8 @@ class HttpApi:
         self.hub = hub
         self.web_dir = web_dir
         self.websockets: set[web.WebSocketResponse] = set()
+        #: (device_id, stream_id) -> (fetched_ms, jpeg bytes)
+        self._preview_cache: dict[tuple[str, str], tuple[int, bytes]] = {}
 
     # -- app wiring ------------------------------------------------------
     def build(self) -> web.Application:
@@ -116,6 +128,10 @@ class HttpApi:
                 web.post("/alerts/{id}/dismiss", self.dismiss),
                 web.get("/devices", self.list_devices),
                 web.get("/devices/{device_id}/config", self.export_device_config),
+                web.get(
+                    "/devices/{device_id}/streams/{stream_id}/preview.jpg",
+                    self.stream_preview,
+                ),
                 web.put("/devices/{device_id}/config", self.import_device_config),
                 web.get("/rules", self.all_rules),
                 web.get("/rules/{device_id}/{stream_id}", self.get_rules),
@@ -334,6 +350,83 @@ class HttpApi:
             device_id, validated, self.hub.clock.wall_ms()
         )
         return json_response({"saved": results})
+
+    async def stream_preview(self, request: web.Request) -> web.StreamResponse:
+        """Proxy one still frame from the device preview endpoint (§4).
+
+        The device advertises ``preview_url`` as a device-local address, which a
+        remote browser cannot reach. The hub fetches it once per cache window and
+        hands back the JPEG. A device that is down, slow or serving something that
+        is not an image yields 502 with the reason, never a silent grey canvas.
+        """
+        device_id = request.match_info["device_id"]
+        stream_id = request.match_info["stream_id"]
+        key = (device_id, stream_id)
+        now = self.hub.clock.wall_ms()
+
+        cached = self._preview_cache.get(key)
+        if cached is not None and now - cached[0] < PREVIEW_CACHE_MS:
+            return self._jpeg_response(cached[1], age_ms=now - cached[0])
+
+        device = next(
+            (d for d in self.hub.registry.list_devices() if d["device_id"] == device_id),
+            None,
+        )
+        if device is None:
+            return error("device not found", 404)
+        stream = next(
+            (
+                s
+                for s in (device.get("streams") or [])
+                if str(s.get("stream_id")) == stream_id
+            ),
+            None,
+        )
+        if stream is None:
+            return error("stream not found", 404)
+        preview_url = stream.get("preview_url")
+        if not preview_url:
+            return error("stream reports no preview_url", 404)
+
+        body = await self._fetch_preview(str(preview_url))
+        if isinstance(body, str):
+            self._preview_cache.pop(key, None)
+            return json_response(
+                {"error": body, "preview_url": preview_url}, status=502
+            )
+        self._preview_cache[key] = (now, body)
+        return self._jpeg_response(body, age_ms=0)
+
+    @staticmethod
+    async def _fetch_preview(preview_url: str) -> bytes | str:
+        """Return JPEG bytes, or an error string describing why not."""
+        timeout = aiohttp.ClientTimeout(total=PREVIEW_TIMEOUT_S)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(preview_url) as response:
+                    if response.status != 200:
+                        return f"device returned HTTP {response.status}"
+                    raw = await response.content.read(PREVIEW_MAX_BYTES + 1)
+        except aiohttp.ClientError as exc:
+            return f"device unreachable: {type(exc).__name__}: {exc}"
+        except TimeoutError:
+            return f"device did not answer within {PREVIEW_TIMEOUT_S:g}s"
+        if len(raw) > PREVIEW_MAX_BYTES:
+            return f"preview larger than {PREVIEW_MAX_BYTES} bytes"
+        if not raw.startswith(b"\xff\xd8"):
+            return "device did not return a JPEG"
+        return raw
+
+    @staticmethod
+    def _jpeg_response(body: bytes, age_ms: int) -> web.Response:
+        return web.Response(
+            body=body,
+            content_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Preview-Age-Ms": str(int(age_ms)),
+            },
+        )
 
     # -- rules -----------------------------------------------------------
     async def all_rules(self, request: web.Request) -> web.Response:

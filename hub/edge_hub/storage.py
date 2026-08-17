@@ -75,6 +75,19 @@ CREATE TABLE IF NOT EXISTS auth (
   password_hash TEXT NOT NULL,
   must_change   INTEGER NOT NULL DEFAULT 1
 );
+
+-- HUB_SPEC §7: sessions outlive the process. A hub restart (upgrade, crash,
+-- power cut) must not log every operator out mid-incident, so the session table
+-- lives in the same SQLite file as everything else. `expires_ms` is the sliding
+-- idle deadline, recomputed on use; a row past it is invalid whether or not the
+-- sweeper has removed it yet.
+CREATE TABLE IF NOT EXISTS sessions (
+  token       TEXT PRIMARY KEY,
+  username    TEXT NOT NULL,
+  created_ms  INTEGER NOT NULL,
+  expires_ms  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_ms);
 """
 
 #: HUB_SPEC §4: config_versions keeps the most recent 50 revisions per scope.
@@ -556,6 +569,49 @@ class Storage:
                  must_change = excluded.must_change""",
             (username, password_hash, int(must_change)),
         )
+
+    # -- sessions --------------------------------------------------------
+    def insert_session(
+        self, token: str, username: str, created_ms: int, expires_ms: int
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO sessions (token, username, created_ms, expires_ms)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(token) DO UPDATE SET
+                 username = excluded.username,
+                 created_ms = excluded.created_ms,
+                 expires_ms = excluded.expires_ms""",
+            (token, username, created_ms, expires_ms),
+        )
+
+    def get_session(self, token: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT token, username, created_ms, expires_ms FROM sessions WHERE token = ?",
+            (token,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def touch_session(self, token: str, expires_ms: int) -> None:
+        self.conn.execute(
+            "UPDATE sessions SET expires_ms = ? WHERE token = ?", (expires_ms, token)
+        )
+
+    def delete_session(self, token: str) -> None:
+        self.conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+
+    def delete_sessions_except(self, keep_token: str | None) -> int:
+        cur = self.conn.execute(
+            "DELETE FROM sessions WHERE token IS NOT ?", (keep_token,)
+        )
+        return cur.rowcount or 0
+
+    def purge_expired_sessions(self, now_ms: int) -> int:
+        cur = self.conn.execute("DELETE FROM sessions WHERE expires_ms <= ?", (now_ms,))
+        return cur.rowcount or 0
+
+    def count_sessions(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()
+        return int(row["n"])
 
     # -- retention -------------------------------------------------------
     def purge_older_than(self, cutoff_ms: int) -> int:

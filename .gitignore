@@ -6,3 +6,4 @@ data/
 *.sqlite3
 snapshots/
 node_modules/
+web/screenshots/

@@ -56,13 +56,25 @@ values on a real 720p frame.
 
 ## Preview endpoint
 
-`preview_enabled` starts a small HTTP server (default `:8099`) returning the
-latest frame as JPEG at `/preview.jpg` and `/preview/<stream_id>.jpg`, with
-`Access-Control-Allow-Origin: *` so the hub's rule canvas can fetch it
-browser-side as a backdrop. The URL is advertised in
-`status.streams[].preview_url` only when `preview_advertise_host` is set — the
-device cannot guess which address the browser can reach, so an unset value omits
-the field rather than publishing a wrong one.
+`preview_enabled` starts a small HTTP server (default `:8099`) with two routes:
+
+| Route | Serves | Advertised as |
+|---|---|---|
+| `/preview.jpg`, `/preview/<stream_id>.jpg` | the latest frame as JPEG | `status.streams[].preview_url` |
+| `/live`, `/live/<stream_id>`, `/` | an HTML page reloading that JPEG once a second | `status.streams[].live_url` |
+
+Both carry `Access-Control-Allow-Origin: *`. The JPEG route is what the hub's
+single-frame proxy fetches for the rule-canvas backdrop (HUB_SPEC §4); the HTML
+route is what the workbench "live view" button opens. The live page is a
+refreshing still, not a video stream — no second encode path, and it renders in
+any browser.
+
+Both URLs are advertised only when `preview_advertise_host` is set: the device
+cannot guess which address the browser can reach, so an unset value omits the
+fields rather than publishing wrong ones. Note that a `preview_advertise_host` of
+`127.0.0.1` is correct for the device itself and useless to a remote browser —
+that is precisely the case the hub proxy covers, and the reason `live_url` should
+point at an address other machines can resolve when one exists.
 
 ## Health reporting
 

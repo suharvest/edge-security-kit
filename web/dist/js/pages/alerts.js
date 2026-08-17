@@ -7,7 +7,7 @@ import { setQuery } from '../router.js';
 import { Icon, eventIcon } from '../icons.js';
 import { Modal, Field, Select, Empty, Spinner, Banner } from '../components/ui.js';
 import { stage, undoNow, secondsLeft, UNDO_MS } from '../undo.js';
-import { absTime, relTime, eventLabel, alertTs, rangeBounds, dateInputValue, errMsg } from '../util.js';
+import { absTime, relTime, eventLabel, alertTs, rangeBounds, dateInputValue, errMsg, streamIds, findStream } from '../util.js';
 import { shouldPrompt, dismissPrompt, requestNow } from '../notify.js';
 import { isSoundOn, isUnlocked } from '../sound.js';
 
@@ -107,7 +107,7 @@ function FilterPanel({ f, set, devices, rules, onExport }) {
     const out = new Set();
     devices.forEach((d) => {
       if (f.device_id && d.device_id !== f.device_id) return;
-      Object.keys(d.streams || {}).forEach((s) => out.add(s));
+      streamIds(d).forEach((s) => out.add(s));
     });
     return Array.from(out);
   }, [devices, f.device_id]);
@@ -210,7 +210,7 @@ function Snapshot({ a, onOpen, thumb }) {
 
 function AlertCard({ a, flash, batch, checked, onCheck, onOpen, ruleStats, devices }) {
   const dev = devices.find((d) => d.device_id === a.device_id);
-  const liveUrl = (((dev || {}).streams || {})[a.stream_id] || {}).live_url || a.live_url || null;
+  const liveUrl = (findStream(dev, a.stream_id) || {}).live_url || a.live_url || null;
   const rs = ruleStats[a.rule_name];
   const hotRule = rs && rs.rate > FP_WARN && rs.total >= 4;
   const disp = (kind) => stage(kind, [a.id]);
@@ -262,7 +262,7 @@ function AlertCard({ a, flash, batch, checked, onCheck, onOpen, ruleStats, devic
 
 function DetailModal({ a, onClose, devices }) {
   const dev = devices.find((d) => d.device_id === a.device_id);
-  const liveUrl = (((dev || {}).streams || {})[a.stream_id] || {}).live_url || null;
+  const liveUrl = (findStream(dev, a.stream_id) || {}).live_url || null;
   return html`
     <${Modal} wide=${true} title=${t('alerts.detail') + ' #' + a.id} onClose=${onClose} footer=${html`
       ${a.state === 'new' ? html`

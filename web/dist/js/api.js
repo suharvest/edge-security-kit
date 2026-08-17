@@ -78,6 +78,11 @@ export const api = {
   devices: () => req('GET', '/devices'),
   deviceConfig: (id) => req('GET', '/devices/' + encodeURIComponent(id) + '/config'),
   putDeviceConfig: (id, body) => req('PUT', '/devices/' + encodeURIComponent(id) + '/config', body),
+  // Hub-side single-frame proxy. The device's own preview_url is a device-local
+  // address the browser usually cannot reach; this one is same-origin and carries
+  // the session cookie. HUB_SPEC §4.
+  streamPreviewUrl: (id, sid) =>
+    BASE + '/devices/' + encodeURIComponent(id) + '/streams/' + encodeURIComponent(sid) + '/preview.jpg',
 
   rules: () => req('GET', '/rules'),
   streamRules: (d, s) => req('GET', '/rules/' + encodeURIComponent(d) + '/' + encodeURIComponent(s)),

@@ -116,7 +116,13 @@ hub (单 origin, cookie 会话)
 
 组件：`StreamPicker` `RuleCanvas` `DrawToolbar` `ZoneList` `LineList` `DirectionToggle` `DwellInput` `SaveStatus` `SimulateButton`。
 
-底图来源：`GET /api/devices` 透传的流 `preview_url`（设备本地单帧 JPEG 端点，status 消息可选字段），由浏览器直接向设备 origin 拉取——设备端需允许 CORS GET；hub 不代理图像。`preview_url` 缺失或不可达时降级：空画布（按 `frame.w/h` 比例的灰底）+ `GET /api/live/{device_id}/{stream_id}` 最近一条 detections 的叠加框，仍可完成绘制。
+底图来源，按顺序取第一个能解码出来的：
+
+1. **hub 单帧代理** `GET /api/devices/{device_id}/streams/{stream_id}/preview.jpg`（HUB_SPEC §4）。同 origin、带会话 cookie，hub 服务端去拉设备的 `preview_url`。这是默认路径：`preview_url` 是设备本地地址（`http://127.0.0.1:8099/...`），运维的浏览器通常和设备不在同一台机器上，直连必然失败。
+2. **直连 `preview_url`**（`GET /api/devices` 透传的流字段）。仅当浏览器恰好在设备网段、且设备允许 CORS GET 时才成立，属于可选优化：省一跳、绕开缓存窗口。失败即静默回退到第 1 项，不给用户报错。
+3. **灰底降级**：两者都取不到时用按 `frame.w/h` 比例的空画布 + `GET /api/live/{device_id}/{stream_id}` 最近一条 detections 的叠加框，仍可完成绘制。
+
+代理端点 502 时画布不空白报错，直接走第 3 项——底图是参照物，不是绘制的前置条件。
 
 ### 2.4 设备本地调试页
 
@@ -205,8 +211,8 @@ hub (单 origin, cookie 会话)
   - 在线状态：●绿在线 / ●灰离线（LWT），离线行整体降饱和，显示最后在线时间。
   - `DecodeBadge`：`health.decode` — `hw` 绿色徽标；`sw` 黄色徽标 + tooltip"硬件解码回退到 CPU，性能受损，检查设备解码插件"。黄色状态同时计入设备页 tab 上的角标数。
   - 每流 FPS：`health.fps`，低于阈值（默认 8）标黄。
-  - 版本：探测器镜像版本（status payload `version` 字段）。
-  - 操作：`[配置]` 展开 ConfigPanel；`[本地页]` 新窗口打开设备本地调试页（地址取流的 `live_url`，缺失时该按钮禁用并 tooltip 提示设备固件不支持）。
+  - 版本：探测器版本 `versions.app`（status payload 的 `versions` 对象，不是扁平的 `version`）；`versions.model` 作副行/tooltip 显示模型标识。
+  - 操作：`[配置]` 展开 ConfigPanel；`[本地页]` 新窗口打开设备本地调试页（地址取流的 `live_url`；探测器把它指向自己预览服务的 `/live/<stream_id>` 自刷新页面。字段缺失时该按钮禁用并 tooltip 提示设备固件不支持）。
 - `ConfigPanel`：
   - 备份下载：`GET /api/devices/{id}/config` → JSON 文件下载（含该设备全部流的规则+摄像头配置）。
   - 恢复上传：`RestoreDialog` 选文件 → 预览 diff 摘要（zone/line/流数量变化）→ 确认后 `PUT`。
@@ -234,10 +240,12 @@ hub (单 origin, cookie 会话)
 - 认证：会话 cookie（HttpOnly，浏览器对同 origin WS 握手自动携带；无 Authorization 头方案——浏览器 WS API 不支持自定义头）。会话失效时握手被拒，前端跳登录页。
 - 消息形状（server→client，`type` 区分）：
 
+  `device.streams` 是**数组**，每项自带 `stream_id`（contracts/mqtt-detection.schema.json 的 `stream_status`，hub 原样透传）。前端一律按 `stream_id` 取项，不得当作以流 id 为键的对象——那样读出来的"流 id"是数组下标 `0`/`1`，规则会存到一个不存在的流上。`web/tools/check-streams-shape.mjs` 是这条的回归闸门。
+
 ```json
 {"type": "alert.new",    "alert": { "id": 1024, "ts_ms": 1755400000123, "received_ms": 1755400000188, "device_id": "jetson-01", "stream_id": "cam-02", "event_type": "zone_enter", "rule_name": "restricted_area", "track_id": 7, "score": 0.82, "state": "new", "snapshot_state": "pending", "snapshot_url": null, "simulated": false }}
 {"type": "alert.update", "alert": { "id": 1024, "ts_ms": 1755400000123, "state": "acked", "acted_by": "operator", "acted_at": 1755400012000 }}
-{"type": "device.status","device": { "device_id": "rk3588-02", "online": false, "streams": {"cam-01": {"decode": "sw", "fps": 6.2}} }}
+{"type": "device.status","device": { "device_id": "rk3588-02", "online": false, "versions": {"app": "0.2.0", "model": "yolov8n@fb38b393"}, "streams": [{"stream_id": "cam-01", "state": "reconnecting", "decode": "sw", "fps": 6.2}] }}
 ```
 
 - **时间字段只有 `ts_ms`**（设备时间戳，展示/取证）与 `received_ms`（hub 接收时刻，

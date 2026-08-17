@@ -6,6 +6,7 @@ import { api } from '../api.js';
 import { navigate, linkProps } from '../router.js';
 import { isSoundOn, setSoundOn, isUnlocked } from '../sound.js';
 import { stopWs } from '../ws.js';
+import { streamList } from '../util.js';
 
 function ConnBadge() {
   const st = useStore();
@@ -23,8 +24,7 @@ function ConnBadge() {
 function swDecodeCount(devices) {
   let n = 0;
   (devices || []).forEach((d) => {
-    const streams = d.streams || {};
-    Object.keys(streams).forEach((k) => { if ((streams[k] || {}).decode === 'sw') n += 1; });
+    streamList(d).forEach((s) => { if (s.decode === 'sw') n += 1; });
   });
   return n;
 }

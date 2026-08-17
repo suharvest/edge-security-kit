@@ -6,7 +6,7 @@ import { api } from '../api.js';
 import { useStore, commit, toast } from '../store.js';
 import { Icon } from '../icons.js';
 import { Modal, Field, Empty, Spinner, Confirm } from '../components/ui.js';
-import { absTime, relTime, downloadBlob, slug, errMsg } from '../util.js';
+import { absTime, relTime, downloadBlob, slug, errMsg, streamList, streamIds } from '../util.js';
 import { linkProps } from '../router.js';
 import { permission, reonboard } from '../notify.js';
 
@@ -22,13 +22,13 @@ function DecodeBadge({ decode }) {
     </span>`;
 }
 
-function StreamCells({ streams }) {
-  const ids = Object.keys(streams || {});
-  if (!ids.length) return html`<span class="dim">${t('devices.noStreams')}</span>`;
+function StreamCells({ device }) {
+  const list = streamList(device);
+  if (!list.length) return html`<span class="dim">${t('devices.noStreams')}</span>`;
   return html`
     <div class="stream-cells">
-      ${ids.map((id) => {
-        const s = streams[id] || {};
+      ${list.map((s) => {
+        const id = String(s.stream_id);
         const low = typeof s.fps === 'number' && s.fps < FPS_WARN;
         return html`
           <div class="stream-cell" key=${id}>
@@ -203,6 +203,20 @@ function ConfigPanel({ device, hubConfig }) {
     </div>`;
 }
 
+// The hub reports `versions: {app, model}` (contracts §status_message); there is no
+// flat `version` field. The app version is the row value, the model id the subline.
+function VersionCell({ device }) {
+  const v = (device && device.versions) || {};
+  const app = v.app || device.version || (device.info && device.info.version) || null;
+  const model = v.model || null;
+  if (!app && !model) return html`<span>—</span>`;
+  return html`
+    <span title=${model ? t('devices.model') + ': ' + model : ''}>
+      ${app || '—'}
+      ${model ? html`<div class="dim small break">${model}</div>` : null}
+    </span>`;
+}
+
 export function DevicesPage() {
   const st = useStore();
   const [open, setOpen] = useState(null);
@@ -226,14 +240,13 @@ export function DevicesPage() {
 
   const swCount = useMemo(() => {
     let n = 0;
-    st.devices.forEach((d) => Object.keys(d.streams || {}).forEach((k) => { if ((d.streams[k] || {}).decode === 'sw') n += 1; }));
+    st.devices.forEach((d) => streamList(d).forEach((s) => { if (s.decode === 'sw') n += 1; }));
     return n;
   }, [st.devices]);
 
   const localUrl = (d) => {
-    const streams = d.streams || {};
-    const k = Object.keys(streams).find((x) => streams[x] && streams[x].live_url);
-    return k ? streams[k].live_url : null;
+    const s = streamList(d).find((x) => x.live_url);
+    return s ? s.live_url : null;
   };
 
   return html`
@@ -284,8 +297,8 @@ export function DevicesPage() {
                           ${t('devices.lastSeen', { t: relTime(d.last_seen_ms) })}
                         </div>` : null}
                     </td>
-                    <td><${StreamCells} streams=${d.streams} /></td>
-                    <td class="mono">${d.version || (d.info && d.info.version) || '—'}</td>
+                    <td><${StreamCells} device=${d} /></td>
+                    <td class="mono"><${VersionCell} device=${d} /></td>
                     <td class="dev-actions">
                       <button class="btn btn-sm" onClick=${() => setOpen(isOpen ? null : d.device_id)}>
                         ${Icon.gear({ size: 14 })} ${t('devices.config')}
@@ -295,7 +308,7 @@ export function DevicesPage() {
                          onClick=${(e) => { if (!url) e.preventDefault(); }}>
                         ${Icon.ext({ size: 14 })} ${t('devices.localPage')}
                       </a>
-                      <a class="btn btn-sm" ...${linkProps('/rules', { device_id: d.device_id, stream_id: Object.keys(d.streams || {})[0] || '' })}>
+                      <a class="btn btn-sm" ...${linkProps('/rules', { device_id: d.device_id, stream_id: streamIds(d)[0] || '' })}>
                         ${t('nav.rules')}
                       </a>
                     </td>

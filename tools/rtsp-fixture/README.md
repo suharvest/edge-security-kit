@@ -76,7 +76,8 @@ system is started.
 | `diagnose.py` | Post-mortem on a tap: inter-frame gaps, fps, track lifetimes. Run this first when alerts look wrong. |
 | `restart_fixture.sh` | Republish truth at 5 fps and restart both detectors with a bounded ONNX thread pool. |
 | `regress_restart.sh` | Regression for the `event_id` collision: restart the hub while the detectors keep running (so `session_id` is unchanged) and confirm alerting resumes (HUB_SPEC §3). |
-| `restart_hub_verify.sh` | Restart-persistence check: alerts and dispositions survive a hub restart (HUB_SPEC §10). |
+| `restart_hub_verify.sh` | Restart-persistence check: alerts, dispositions **and the session cookie** survive a hub restart (HUB_SPEC §10, §7). |
+| `verify_ws_catchup.py` | Drops the WS for a configurable gap while the stack keeps firing, then reconnects and asserts `GET /alerts?after_id=` returns exactly the missed rows (FRONTEND_SPEC §7). The browser run cannot show this path: a socket that never drops never takes it. |
 | `test_shutdown.sh` | A detector that exits cleanly must leave a retained `online: false` status and show offline on the hub (contracts/MQTT.md, Status and LWT). Uses its own device_id and preview port, so the two running detectors are untouched. |
 | `truth.json` | The trajectory table from the run in the report. Regenerate with `build_truth.py` rather than editing. |
 

@@ -17,6 +17,7 @@ web/
 ├── mock/                     fixture JPEGs used by the mock hub only
 ├── tools/check-i18n.js       zh/en dictionary parity + missing-key check
 ├── tools/test-coords.mjs     FRONTEND_SPEC §4.1 / MQTT.md direction unit tests
+├── tools/check-streams-shape.mjs  device.streams array shape: contract fixture == mock == frontend
 └── screenshots/              verification screenshots
 ```
 
@@ -96,4 +97,12 @@ canvas fallback.
 ```bash
 node web/tools/check-i18n.js     # dictionary parity, missing keys, dynamic prefixes
 node web/tools/test-coords.mjs   # §4.1 fit/round-trip/clamp + forward-direction convention
+node web/tools/check-streams-shape.mjs   # device.streams is an array everywhere
 ```
+
+`check-streams-shape.mjs` exists because the mock hub once modelled `streams` as an
+object keyed by stream id while the contract and the real hub used an array. The
+frontend was written against the mock, so every screen showed `0` as the stream id and
+the rule editor saved rules to a stream that did not exist. The script asserts the
+contract fixture, the mock's `GET /api/devices` and the frontend's access pattern all
+agree, and fails if any source file goes back to `Object.keys(device.streams)`.

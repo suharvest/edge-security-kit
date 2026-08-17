@@ -1,9 +1,15 @@
 """Single-account cookie session auth (HUB_SPEC §7).
 
-Sessions are server-side and in-memory only: a hub restart invalidates them by
-design. The cookie is HttpOnly + SameSite=Strict so the same credential covers
-REST and the WS handshake (browsers cannot set an Authorization header on a WS
-upgrade, which is why Basic Auth is not used).
+Sessions are server-side and persisted in the hub SQLite file: a restart —
+upgrade, crash, power cut — leaves every unexpired session valid, so an operator
+is not logged out mid-incident by a process that came back in two seconds. The
+cookie is HttpOnly + SameSite=Strict so the same credential covers REST and the
+WS handshake (browsers cannot set an Authorization header on a WS upgrade, which
+is why Basic Auth is not used).
+
+The token in the cookie is the primary key of the ``sessions`` row; ``expires_ms``
+is a sliding idle deadline pushed forward on every use. A row past its deadline is
+rejected and deleted on sight, so an unswept table never grants access.
 """
 
 from __future__ import annotations
@@ -56,7 +62,9 @@ class AuthManager:
         self.storage = storage
         self.clock = clock or Clock()
         self.idle_ms = idle_days * 86_400_000
-        self._sessions: dict[str, Session] = {}
+        # Drop anything already past its deadline at start-up rather than carrying
+        # dead rows until the next resolve() happens to touch them.
+        self.storage.purge_expired_sessions(self.clock.wall_ms())
 
     def ensure_default_account(
         self, username: str = DEFAULT_USERNAME, password: str | None = None
@@ -79,26 +87,31 @@ class AuthManager:
         if record is None or not verify_password(password, record["password_hash"]):
             return None
         token = secrets.token_urlsafe(32)
-        session = Session(token=token, username=username, last_used_ms=self.clock.wall_ms())
-        self._sessions[token] = session
-        return session
+        now = self.clock.wall_ms()
+        self.storage.insert_session(
+            token=token,
+            username=username,
+            created_ms=now,
+            expires_ms=now + int(self.idle_ms),
+        )
+        return Session(token=token, username=username, last_used_ms=now)
 
     def resolve(self, token: str | None) -> Session | None:
         if not token:
             return None
-        session = self._sessions.get(token)
-        if session is None:
+        row = self.storage.get_session(token)
+        if row is None:
             return None
         now = self.clock.wall_ms()
-        if now - session.last_used_ms > self.idle_ms:
-            del self._sessions[token]
+        if int(row["expires_ms"]) <= now:
+            self.storage.delete_session(token)
             return None
-        session.last_used_ms = now
-        return session
+        self.storage.touch_session(token, now + int(self.idle_ms))
+        return Session(token=token, username=str(row["username"]), last_used_ms=now)
 
     def logout(self, token: str | None) -> None:
         if token:
-            self._sessions.pop(token, None)
+            self.storage.delete_session(token)
 
     def change_password(
         self, username: str, old_password: str, new_password: str, keep_token: str | None = None
@@ -113,8 +126,7 @@ class AuthManager:
         if len(new_password) < 8:
             return "new password must be at least 8 characters"
         self.storage.set_auth(username, hash_password(new_password), must_change=False)
-        for token in [t for t in self._sessions if t != keep_token]:
-            del self._sessions[token]
+        self.storage.delete_sessions_except(keep_token)
         return None
 
     def must_change(self, username: str) -> bool:
