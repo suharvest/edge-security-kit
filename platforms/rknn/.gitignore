@@ -1,0 +1,5 @@
+.venv/
+models/*.rknn
+models/*.onnx
+fixtures/*.jpg
+__pycache__/
