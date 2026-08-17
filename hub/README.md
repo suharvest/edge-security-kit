@@ -19,3 +19,9 @@ Layout:
 | `edge_hub/alert_manager.py` | §3 cooldown, state machine, snapshot lifecycle |
 | `edge_hub/storage.py` | §6 SQLite DDL + §4 atomic config write |
 | `edge_hub/http_api.py` | §4 REST, §5 WS, §7 auth, static hosting |
+
+Each hub process takes a unique MQTT client id
+(`edge-security-hub-<host>-<4 hex>`) unless `MQTT_CLIENT_ID` or `config.json`
+pins one. Two hubs sharing an id disconnect each other in a loop and silently
+drop QoS 0 detections — see HUB_SPEC §8. The value in use is in
+`GET /api/health` as `mqtt_client_id`.
