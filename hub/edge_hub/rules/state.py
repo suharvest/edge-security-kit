@@ -23,10 +23,29 @@ class TrackState:
     #: previous centroid, and the hub monotonic ms at which it was received
     last_point: Point | None = None
     last_point_mono: float | None = None
+    #: line key -> last *non-zero* side of that line (contracts/MQTT.md
+    #: `direction`). A frame whose centroid lands exactly on the line (side 0)
+    #: leaves this untouched: the track counts as still on the side it came
+    #: from.
+    line_side: dict[str, int] = field(default_factory=dict)
+    #: line key -> the centroid that produced :attr:`line_side`, so the finite
+    #: segment test spans the whole on-line excursion, not just one frame pair
+    line_anchor: dict[str, Point] = field(default_factory=dict)
 
     def reset_line_chain(self, point: Point, mono_ms: float) -> None:
         self.last_point = point
         self.last_point_mono = mono_ms
+
+    def note_line_side(self, key: str, side_value: int, point: Point) -> None:
+        """Record a non-zero side. Zero is ignored, by contract."""
+        if side_value == 0:
+            return
+        self.line_side[key] = side_value
+        self.line_anchor[key] = point
+
+    def forget_line_sides(self) -> None:
+        self.line_side.clear()
+        self.line_anchor.clear()
 
 
 @dataclass

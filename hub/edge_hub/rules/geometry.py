@@ -61,16 +61,28 @@ def side(start: Point, end: Point, p: Point) -> int:
     return 0
 
 
+def direction_from_sides(prev_side: int, curr_side: int) -> str | None:
+    """Classify a sign flip between two sides.
+
+    ``forward`` is ``+1 -> -1``, ``backward`` is ``-1 -> +1``. Any pair
+    involving a zero returns ``None``: a point exactly on the line carries no
+    side information. contracts/MQTT.md `direction` therefore requires callers
+    to compare the current side against the track's *last non-zero* side rather
+    than against the immediately preceding frame.
+    """
+    if prev_side > 0 and curr_side < 0:
+        return "forward"
+    if prev_side < 0 and curr_side > 0:
+        return "backward"
+    return None
+
+
 def crossing_direction(start: Point, end: Point, prev: Point, curr: Point) -> str | None:
     """Classify a crossing of the directed segment ``start -> end``.
 
-    Returns ``"forward"``, ``"backward"`` or ``None`` when the sign does not
-    flip cleanly (a point exactly on the line is not a decidable crossing).
+    Stateless two-point form, for callers that already hold a decided pair.
+    Returns ``None`` when either point lies on the line — the stateful
+    last-non-zero-side rule in :mod:`edge_hub.rules.line` is what resolves that
+    case for live tracks.
     """
-    s_prev = side(start, end, prev)
-    s_curr = side(start, end, curr)
-    if s_prev > 0 and s_curr < 0:
-        return "forward"
-    if s_prev < 0 and s_curr > 0:
-        return "backward"
-    return None
+    return direction_from_sides(side(start, end, prev), side(start, end, curr))

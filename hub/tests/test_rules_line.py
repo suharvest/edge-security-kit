@@ -114,3 +114,94 @@ def test_line_crossing_feature_flag_off(clock):
     )
     engine = RuleEngine(lambda d, s: body, clock=clock)
     assert walk(engine, [LEFT, RIGHT], clock=clock) == []
+
+
+# --- side == 0: the centroid lands exactly on the line ----------------------
+#
+# contracts/MQTT.md `direction`: compare against the track's last *non-zero*
+# side. Detector centroids are quantized (the RK3588 preprocessor scales 1280
+# down to 640, so cx snaps to multiples of 1/640 and x = 0.5 is exactly
+# 320/640), which puts a line drawn down the middle of the frame on side 0 for
+# every frame of the traverse.
+
+ON_LINE = (0.5, 0.5)
+#: 1/640 grid values straddling the mid-frame line at 320/640 = 0.5
+G = [x / 640.0 for x in (312, 316, 320, 320, 324, 328)]
+
+
+def walk_all(engine: RuleEngine, points, step_ms: float = 200.0, clock=None):
+    """Feed a sequence of centroids, returning every candidate they produced."""
+    seen = []
+    for index, (x, y) in enumerate(points, start=1):
+        if clock is not None and index > 1:
+            clock.advance(step_ms)
+        seen.extend(engine.on_detections(detection(x, y, frame_id=index)))
+    return seen
+
+
+def test_a_frame_on_the_line_is_not_yet_a_crossing(clock):
+    engine = make_engine(clock)
+    assert walk_all(engine, [LEFT, ON_LINE], clock=clock) == []
+
+
+def test_crossing_through_a_frame_on_the_line_fires_once_forward(clock):
+    engine = make_engine(clock)
+    fired = walk_all(engine, [LEFT, ON_LINE, RIGHT], clock=clock)
+    assert [(c.event_type, c.direction) for c in fired] == [("line_cross", "forward")]
+
+
+def test_several_frames_on_the_line_still_resolve_the_crossing(clock):
+    engine = make_engine(clock)
+    fired = walk_all(engine, [LEFT, ON_LINE, ON_LINE, ON_LINE, RIGHT], clock=clock)
+    assert [c.direction for c in fired] == ["forward"]
+
+
+def test_quantized_midline_walk_fires_exactly_one_forward(clock):
+    """The RK3588 case: cx on the 1/640 grid, line drawn at x = 0.5."""
+    engine = make_engine(clock)
+    fired = walk_all(engine, [(x, 0.5) for x in G], clock=clock)
+    assert [(c.rule_id, c.direction) for c in fired] == [("gate", "forward")]
+
+
+def test_jitter_across_the_line_does_not_refire(clock):
+    """side +1, 0, +1, 0, +1 -- never leaves the left side, never fires."""
+    engine = make_engine(clock)
+    fired = walk_all(
+        engine, [LEFT, ON_LINE, LEFT, ON_LINE, (0.48, 0.5), ON_LINE], clock=clock
+    )
+    assert fired == []
+
+
+def test_dwelling_exactly_on_the_line_does_not_fire(clock):
+    engine = make_engine(clock)
+    assert walk_all(engine, [LEFT] + [ON_LINE] * 6, clock=clock) == []
+
+
+def test_track_starting_on_the_line_does_not_cross(clock):
+    """No last non-zero side yet, so leaving the line only seeds one."""
+    engine = make_engine(clock)
+    assert walk_all(engine, [ON_LINE, RIGHT, (0.8, 0.5)], clock=clock) == []
+
+
+def test_track_starting_on_the_line_still_reports_a_later_traverse(clock):
+    engine = make_engine(clock)
+    fired = walk_all(engine, [ON_LINE, RIGHT, ON_LINE, LEFT], clock=clock)
+    assert [c.direction for c in fired] == ["backward"]
+
+
+def test_direction_filter_applies_to_an_on_line_crossing(clock):
+    engine = make_engine(clock, direction="backward")
+    assert walk_all(engine, [LEFT, ON_LINE, RIGHT], clock=clock) == []
+    clock.advance(200)
+    fired = engine.on_detections(detection(*LEFT, frame_id=99))
+    assert [c.direction for c in fired] == ["backward"]
+
+
+def test_on_line_excursion_does_not_survive_a_chain_break(clock):
+    """A QoS0 gap re-anchors: the pre-gap side must not decide a crossing."""
+    engine = make_engine(clock, line_chain_gap_ms=1000)
+    engine.on_detections(detection(*LEFT, frame_id=1))
+    clock.advance(200)
+    assert engine.on_detections(detection(*ON_LINE, frame_id=2)) == []
+    clock.advance(1_500)
+    assert engine.on_detections(detection(*RIGHT, frame_id=3)) == []

@@ -81,9 +81,41 @@ sensecraft/security/<device_id>/cmd/snapshot             QoS1, no retain (downli
   altogether — observed in integration, where a run produced two zone alerts
   and then silence.
 - `direction` (line_cross): lines are directed segments `start -> end`. Let
-  `side(p) = sign((end-start) × (p-start))` (2-D cross product). A crossing is
-  `forward` when the track centroid moves from `side > 0` to `side < 0`
-  (left-to-right relative to the arrow), `backward` for the reverse.
+  `side(p) = sign((end-start) × (p-start))` (2-D cross product), which is `+1`,
+  `-1` or `0`. A crossing is `forward` when the track centroid moves from
+  `side > 0` to `side < 0` (left-to-right relative to the arrow), `backward`
+  for the reverse.
+
+  **`side == 0` is specified, not a degenerate case.** A rule engine MUST keep,
+  per track and per line, the last side it observed that was non-zero
+  (`last_nonzero_side`), and decide against that value rather than against the
+  immediately preceding frame:
+
+  - a frame whose centroid gives `side == 0` MUST NOT update
+    `last_nonzero_side` and MUST NOT report a crossing — the track counts as
+    still being on the side it last had;
+  - when the side becomes non-zero and carries the opposite sign to
+    `last_nonzero_side`, that is a crossing; the direction is read off
+    `last_nonzero_side -> current side`, and the finite-segment test runs
+    between the centroid that produced `last_nonzero_side` and the current one;
+  - a track with no `last_nonzero_side` yet — its first frame, or a first
+    observation that was on the line — only seeds the value. Leaving the line
+    towards one side is not a crossing.
+
+  The reason is quantization, not floating-point pedantry. Detector centroids
+  arrive on a coarse grid: the RK3588 preprocessor scales a 1280-wide frame to
+  the 640-wide model input, so `cx` snaps to multiples of 1/640 and `x = 0.5`
+  is exactly 320/640. A line drawn down the middle of the frame — the most
+  natural thing a user does on the rule canvas — then reads `side == 0` on
+  every frame of the traverse. Decided frame to frame, that line never fires,
+  and the symptom is one rule silently never triggering while every other rule
+  on the same stream works. Carrying the last non-zero side resolves the
+  crossing, and still refuses to fire for a track that merely sits on the line
+  and jitters, because its side never takes the opposite sign.
+
+  A break in the frame chain (`line_chain_gap_ms`, HUB_SPEC §2.1) discards
+  `last_nonzero_side` along with the rest of the chain: the track is re-seeded
+  from wherever it is next observed.
 
 ## Status and LWT
 
@@ -159,6 +191,13 @@ dependency-free checks:
 ```bash
 python3 contracts/validate_payload.py path/to/payload.json
 ```
+
+A copy of each platform's captured fixtures is promoted into
+`contracts/fixtures/` and gated by `sh contracts/check_fixtures.sh`, so the
+contract is backed by real payloads from more than one implementation — today
+`platforms/generic` (ONNX, x86) and `platforms/rknn` (RK3588). Each platform's
+`test_fixtures_schema.py` asserts its promoted copy still matches what it
+captured.
 
 ## Relation to the fall-detection contract v1
 

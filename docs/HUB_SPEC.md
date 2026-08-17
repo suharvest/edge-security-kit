@@ -85,7 +85,7 @@ detections 峰值约 8 设备 × 4 流 × 15 Hz = 480 msg/s、每条 ≈1 KB—�
 | behavior_demo.py:63-68 | `ccw` / `segments_intersect` | rules/geometry.py | 原样 + 新增 `side()` 供方向判定 |
 | behavior_demo.py:71-72 | `norm_px` 像素换算 | — | 删除（全程归一化空间） |
 | multi_camera_manager.py:521-540 | zone_enter + loitering（`zone_entered_at` 进出簿记 + dwell 超时） | rules/zone.py | 原样迁移；dwell 计时改用 **hub 接收时刻的本地单调时钟**（设备 `timestamp` 仅展示/取证，见 §2.1 时钟条款） |
-| multi_camera_manager.py:542-554 | line_cross（前后两帧质心连线与线段相交） | rules/line.py | 补方向：`side(prev)` 与 `side(curr)` 符号翻转判 forward/backward（约定见 MQTT.md），规则配置新增 `direction: any\|forward\|backward`，默认 any |
+| multi_camera_manager.py:542-554 | line_cross（前后两帧质心连线与线段相交） | rules/line.py | 补方向：符号翻转判 forward/backward（约定见 MQTT.md），规则配置新增 `direction: any\|forward\|backward`，默认 any。翻转的比较对象不是上一帧，而是该 track 该线的**最后一个非零 side**（`side == 0` 条款见 §2.1） |
 | multi_camera_manager.py:464-482 | `_emit` 冷却（挂在 track 上） | alert_manager | 冷却键改为五元组 `(device_id, stream_id, rule_name, event_type, track_id)`，修复换 track ID 重复报警。`event_type` 必须在键里：zone_enter 与 loitering 共用同一个 rule_name（区域名），旧代码的冷却本就分事件类型（`track.fired_events[etype]`）；退成四元组会让同一 track 的入侵告警吞掉随后的滞留升级——丢的是两者中更严重的那条。另有可选流级限速 `stream_rate_limit_s`（同一 `(device_id, stream_id, rule_name, event_type)` 每 N 秒最多 1 条，即去掉 track_id 的同一把键），**默认 0 = 不限流**：非零值会把同时触发同一规则的两个人合并成一条告警，漏报比重复报警更严重，故为 opt-in |
 | 每 track `zone_entered_at`/`fired_events` | 规则状态 | rules/state.py | 状态按 `(device_id, stream_id, track_id)` 三级索引；track 在 detections 中消失超过 `track_expiry_s`（默认 5s）清除状态 |
 
@@ -109,6 +109,20 @@ detections 峰值约 8 设备 × 4 流 × 15 Hz = 480 msg/s、每条 ≈1 KB—�
   line_cross 的相邻点对若两条消息的 hub 接收间隔超过 `line_chain_gap_ms`
   （默认 1000，可配），视为断链：重置该 track 的线段起点、本对不判穿越——
   防止 QoS0 丢帧造成的大跨度连线误判穿越。
+- **质心正好落在线上（`side == 0`）**：引擎按 `(track, line)` 维护
+  `last_nonzero_side` 与产生它的那个质心。当帧 `side == 0` 时不更新
+  `last_nonzero_side`、不判穿越（视为仍在原侧）；当 side 变为非零且与
+  `last_nonzero_side` 反号时判定穿越，方向由 `last_nonzero_side → 当前 side`
+  决定，有限线段相交测试用"产生 `last_nonzero_side` 的质心 → 当前质心"这一对。
+  尚无 `last_nonzero_side` 的 track（首帧、或起始就落在线上）只做播种，
+  从线上向一侧移动不算穿越；断链会连同 `last_nonzero_side` 一并丢弃。
+
+  这不是浮点边角料：RK3588 预处理把 1280 宽缩到模型输入的 640 宽，`cx` 因此
+  量化到 1/640 网格，而 `x = 0.5` 恰好是 320/640。用户在规则画布上把线画在
+  画面正中间——最自然的操作——该线每一帧都读到 `side == 0`。若逐帧比较，
+  这条线永远不会触发，现象是同一路流上别的规则都正常、唯独它悄无声息。
+  沿用最后一个非零 side 既能判出穿越，又不会让贴着线抖动的目标反复误报
+  （它的 side 从不取反号）。契约条款见 contracts/MQTT.md `direction`。
 
 ## 3. 告警状态机
 
@@ -347,6 +361,17 @@ services:
     ports: ["1883:1883"]
     volumes: ["./mosquitto:/mosquitto/config:ro"]
 ```
+
+**同一 broker 上的多个 hub，MQTT `client_id` 必须唯一。** MQTT 的 client_id 在
+broker 上是排他的：后连上来的客户端顶掉同名的旧连接，旧连接被踢下线后按退避
+重连，再把新连接顶掉，形成约 1 秒一轮的互踢。detections 走 QoS0，被踢的一侧
+直接丢消息，broker 与两侧日志都不会报错。实测症状是偏态的：需要连续两帧的
+`line_cross` 大约丢一半，只需任一帧的 `zone_enter` 看起来一切正常——很难往
+连接层上想。因此 `mqtt_client_id` 默认不再是固定值，而是每个 hub 进程生成的
+`edge-security-hub-<主机名>-<4 位十六进制>`；要固定值时用 `MQTT_CLIENT_ID`
+或 config.json 显式覆盖，此时唯一性由部署者负责。当前生效值由
+`GET /api/health` 的 `mqtt_client_id` 给出，连接成功与断开都会记进日志——
+排查互踢先看这两处。
 
 资源预算（目标值，需核实）：8 设备 × 4 流 × 15 Hz 注入下 hub 稳态 < 1 vCPU、
 RSS < 300 MB、SQLite 写放大可忽略（仅事件落库）。镜像目标 < 150 MB（python-slim
