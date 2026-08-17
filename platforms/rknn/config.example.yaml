@@ -17,7 +17,12 @@ decode_primary: hw
 # a degraded stream really is better than none.
 require_hw_decode: true
 
-model: models/yolov8n_fp16.rk3588.rknn
+# int8 by default: 42 ms in-pipeline inference against fp16's 72 ms, NPU load
+# 8% against 26%, for 0.52 AP@.5:.95 on COCO person (0.61 on small targets).
+# End-to-end rule assertions are unchanged. int8's failure mode is extra
+# low-confidence boxes rather than misses, so raise conf_threshold before
+# reaching for fp16. Roll back with models/yolov8n_zoo_fp16.rk3588.rknn.
+model: models/yolov8n_zoo_int8.rk3588.rknn
 input_size: 640
 conf_threshold: 0.35
 iou_threshold: 0.45

@@ -1,9 +1,30 @@
 # Models
 
-`yolov8n_fp16.rk3588.rknn` is built by `../tools/prepare_model.sh` from the same
-`yolov8n.onnx` the generic platform uses (md5
-`eda19d19a8aa73d54411a6fc1d091c7f`), so both platforms detect with identical
-weights and a coordinate difference cannot be blamed on the model.
+Three models live here, built by `../tools/prepare_model.sh`. See
+`../README.md` for the accuracy and latency comparison between them.
+
+| file | ONNX | md5 of the ONNX | precision |
+|---|---|---|---|
+| `yolov8n_fp16.rk3588.rknn` | stock ultralytics, same file the generic platform uses | `eda19d19a8aa73d54411a6fc1d091c7f` | fp16 |
+| `yolov8n_zoo_fp16.rk3588.rknn` | `airockchip/rknn_model_zoo` | `2a48b1cef26b6722547807a883079f51` | fp16 |
+| `yolov8n_zoo_int8.rk3588.rknn` | `airockchip/rknn_model_zoo` | `2a48b1cef26b6722547807a883079f51` | int8, 400-image PTQ |
+
+The stock export is kept because it is byte-identical to the generic platform's
+weights: a coordinate difference between the two platforms can then never be
+blamed on the model. The zoo export is a different graph (DFL and the final
+concat removed) and is the one that quantizes — every op left in it has an
+RKNPU2 int8 kernel.
+
+The model-zoo ONNX comes from `examples/yolov8/model/download_model.sh`:
+
+```bash
+curl -sSL -o yolov8n_zoo.onnx \
+  https://ftrg.zbox.filez.com/v2/delivery/data/95f00b0fc900458ba134f8b180b3f7a1/examples/yolov8/yolov8n.onnx
+# sha256 0c8716701f471067932b797eeb67c8e5db47c693c2557c881d7679ec12e21bc5
+```
+
+int8 additionally needs `--calib-dir`; the set and the reasoning are in
+`../calibration/`.
 
 The `.rknn` is not committed. `SHA256SUMS` is, so a rebuild is verifiable:
 
