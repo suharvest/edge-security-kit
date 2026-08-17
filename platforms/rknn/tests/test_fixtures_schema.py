@@ -76,3 +76,20 @@ def test_detection_fixture_frame_is_the_original_not_the_letterbox():
             continue
         assert (payload["frame"]["w"], payload["frame"]["h"]) != (640, 640)
         assert payload["frame"]["w"] > payload["frame"]["h"], "fixture must be non-square"
+
+
+#: platform fixture -> its promoted copy under contracts/fixtures/
+PROMOTED = {
+    "detection.json": "detection-rknn-720p.json",
+    "status.json": "status-rknn.json",
+    "status-lwt.json": "status-rknn-lwt.json",
+}
+
+
+@pytest.mark.parametrize("local,promoted", sorted(PROMOTED.items()))
+def test_promoted_copy_matches_this_platform(local: str, promoted: str):
+    """contracts/check_fixtures.sh gates on the promoted copy, so it must not
+    drift from the payload this platform actually captured."""
+    mine = (ROOT / "fixtures" / local).read_text(encoding="utf-8")
+    theirs = (SCHEMA_PATH.parent / "fixtures" / promoted).read_text(encoding="utf-8")
+    assert json.loads(mine) == json.loads(theirs)

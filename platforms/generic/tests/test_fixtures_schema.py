@@ -44,3 +44,20 @@ def test_detection_fixture_invariants(path: Path):
         cx, cy, w, h = det["bbox"]
         assert 0.0 <= cx - w / 2 and cx + w / 2 <= 1.0
         assert 0.0 <= cy - h / 2 and cy + h / 2 <= 1.0
+
+
+#: platform fixture -> its promoted copy under contracts/fixtures/
+PROMOTED = {
+    "detection.json": "detection-generic-720p.json",
+    "status.json": "status-generic.json",
+    "status-lwt.json": "status-generic-lwt.json",
+}
+
+
+@pytest.mark.parametrize("local,promoted", sorted(PROMOTED.items()))
+def test_promoted_copy_matches_this_platform(local: str, promoted: str):
+    """contracts/check_fixtures.sh gates on the promoted copy, so it must not
+    drift from the payload this platform actually captured."""
+    mine = (ROOT / "fixtures" / local).read_text(encoding="utf-8")
+    theirs = (SCHEMA_PATH.parent / "fixtures" / promoted).read_text(encoding="utf-8")
+    assert json.loads(mine) == json.loads(theirs)

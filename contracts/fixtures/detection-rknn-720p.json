@@ -1,0 +1,34 @@
+{
+  "schema": "sensecraft.detection/1",
+  "timestamp": 1786993709019,
+  "session_id": "1786992527822",
+  "frame_id": 5890,
+  "device_id": "rk3588-01",
+  "stream_id": "cam-0",
+  "coordinate_space": "frame_norm",
+  "frame": {
+    "w": 1280,
+    "h": 720
+  },
+  "inference_time_ms": 113.264,
+  "pipeline_ms": 114.919,
+  "detections": [
+    {
+      "track_id": 1,
+      "class": "person",
+      "score": 0.897,
+      "bbox": [
+        0.400781,
+        0.538194,
+        0.21582,
+        0.918056
+      ]
+    }
+  ],
+  "health": {
+    "fps": 5.0,
+    "decode": "hw",
+    "backend": "rknn-lite2-2.3.2",
+    "fallback_active": false
+  }
+}
