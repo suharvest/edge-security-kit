@@ -25,10 +25,16 @@ without tracking would have to run single-box mode instead.
 
 What is reCamera-specific:
 
-* the frame source is the device's own sensor via the rkipc/go2rtc RTSP sub
-  stream, decoded in software by ffmpeg (there is no MPP decoder reachable from
-  userspace on this firmware -- see ``kit/adapters/frame_source.py``), so
-  ``health.decode`` is reported as ``sw``, truthfully;
+* the frame source is the device's own sensor, taken **before** any encoder:
+  the firmware's extension API publishes ISP NV12 dma-buf frames on
+  ``/run/recamera/frame.sock``, and the kit's capability registry selects
+  ``OfficialFrameSource`` for them automatically. Nothing in this process
+  decodes H.264/H.265 -- there is no encode/decode round trip to make hardware-
+  accelerated, which is why chasing an MPP decoder was the wrong question. RGA
+  does NV12->RGB and the letterbox resize. ``health.decode`` is ``hw``, and
+  ``/debug/decode`` serves the ``/proc/self`` evidence behind that word;
+* the replay path (``ESK_SOURCE_FILE``/``source_file``) is a *test fixture*: a
+  local H.264 clip really is decoded by ffmpeg on the CPU, and reports ``sw``;
 * inference is the RV1126B's single-core NPU through ``rknnlite``;
 * JPEG work uses Pillow, not OpenCV, which is not on this Buildroot image.
 
@@ -65,12 +71,7 @@ from esk.publisher import Publisher
 from esk.tracker import IoUTracker
 from esk.zoo_head import PERSON_CLASS_NAME, PersonDetector
 
-APP_VERSION = "0.1.0"
-
-# The only decode path this firmware offers from userspace. Kept as a named
-# constant rather than a literal so `health.fallback_active` compares against
-# something declared, exactly like the RK3588 detector's `decode_primary`.
-DECODE_PRIMARY = "sw"
+APP_VERSION = "0.2.0"
 
 
 def _env(name: str, default=None):
@@ -90,7 +91,16 @@ class IntrusionDetectionApp(App):
     # which is small but is precisely the class of error the truth clip exists
     # to catch. Sharing the RK3588 module also means a coordinate bug cannot
     # hide on one platform.
-    model_frame = "cpu"
+    #
+    # ``hw`` asks the kit for BOTH: ``frame.data`` stays original-resolution RGB
+    # (the preview, the snapshot reply and the annotated evidence frame all need
+    # source pixels) while ``frame.model_data`` is an RGA-produced, already
+    # letterboxed model image. The Python letterbox above is kept as the
+    # fallback and as the reference the hardware geometry is checked against
+    # every frame -- see ``_model_canvas``. On a source that yields no
+    # ``model_data`` (the replay fixture, or an RGA that latched off) the app
+    # behaves exactly as before.
+    model_frame = "hw"
 
     # config_schema fallbacks (the manifest supplies a default for each).
     confidence = 0.35
@@ -107,6 +117,8 @@ class IntrusionDetectionApp(App):
     preview_advertise_host = ""
     source_file = ""
     annotate_path = ""
+    mem_probe = 0
+    malloc_tune = 0
 
     # ------------------------------------------------------------------ setup
 
@@ -151,10 +163,25 @@ class IntrusionDetectionApp(App):
 
         self.frame_id = 0
         self.stream_state = "starting"
-        self.decode_path = DECODE_PRIMARY
+        # Replay is a CPU decode by construction; the camera path is expected to
+        # be the zero-copy ISP broker. `decode_path` is not fixed here -- it is
+        # RESOLVED from the source object once frames start flowing
+        # (`_resolve_decode_path`), so `health.decode` can never disagree with
+        # what /debug/decode reads out of /proc/self.
+        self.decode_primary = "sw" if self.source_file else "hw"
+        self.decode_path = "unknown"
         self.frame_times = collections.deque(maxlen=60)
         self.inference_times = collections.deque(maxlen=600)
         self.pipeline_times = collections.deque(maxlen=600)
+        # Per-stage timings, so "pipeline_ms minus inference_time_ms" stops
+        # being attributed by guesswork. Same bound as the series above.
+        self.stage_times = {
+            k: collections.deque(maxlen=600)
+            for k in ("letterbox", "store", "infer", "track", "publish", "emit")
+        }
+        self.letterbox_hw = 0
+        self.letterbox_cpu = 0
+        self._geometry_mismatch = None
         self.store = FrameStore()
         self._stop = False
         self._annotated_written = False
@@ -163,9 +190,27 @@ class IntrusionDetectionApp(App):
         # Preview/live endpoints. Advertised in status only when a reachable
         # host was configured: the device cannot guess which address a browser
         # will use, and a wrong URL is worse for the hub UI than an absent one.
+        # Allocator tuning is OFF by default. Pinning glibc's mmap threshold was
+        # tried against the RSS growth and MEASURED NOT TO FIX IT (growth
+        # continued at 30 MB/min) while costing ~19 ms per frame in extra page
+        # faults, so it is kept only as a switch for re-testing the hypothesis
+        # on a different firmware, never as a default. See `tune_allocator`.
+        alloc = {"applied": False, "reason": "disabled by default"}
+        if str(_env("ESK_MALLOC_TUNE", self.malloc_tune)) not in ("0", "", "False"):
+            from esk.mem_probe import tune_allocator
+
+            alloc = tune_allocator()
+        print(f"[intrusion] allocator: {alloc}", flush=True)
+
+        if str(_env("ESK_MEM_PROBE", self.mem_probe)) not in ("0", "", "False"):
+            from esk.mem_probe import start_tracing
+
+            start_tracing()
+
         self.preview_server = start_preview_server(
             self.store, self.stream_id, "0.0.0.0", self.preview_port,
             debug_source=lambda: self._debug_source(),
+            debug_extra=lambda: self._debug_app(),
         )
         preview_url = live_url = ""
         if self.preview_advertise_host:
@@ -232,12 +277,28 @@ class IntrusionDetectionApp(App):
             "backend": self.detector.backend,
             # There is no CPU inference path -- the app refuses to start without
             # the NPU, because rknnlite is the only way it has to run the model.
-            # Decode is the only field that can move, and on this firmware its
-            # primary path is already the software one (no MPP decoder is
-            # reachable from userspace), so `decode: sw` is the honest report
-            # and not a fallback from anything.
-            "fallback_active": self.decode_path != DECODE_PRIMARY,
+            # Decode is the only field that can move: the camera path expects
+            # the zero-copy ISP broker (`hw`), and falling back to an ffmpeg
+            # RTSP decode -- which is what happens if the extension API is not
+            # running -- flips this true.
+            "fallback_active": self.decode_path != self.decode_primary,
         }
+
+    def _resolve_decode_path(self, source) -> str:
+        """Name the live path from the SOURCE OBJECT, never from a constant.
+
+        ``OfficialFrameSource`` hands over ISP dma-buf frames: no compressed
+        bitstream is involved, so no CPU decode happens and ``hw`` is the honest
+        answer to "is the frame path accelerated". Anything ffmpeg-backed is
+        ``sw``. An unrecognised source is reported as ``unknown`` rather than
+        guessed into one of the two contract values.
+        """
+        name = type(source).__name__
+        if name == "OfficialFrameSource":
+            return "hw"
+        if name in ("FfmpegRtspSource", "SnapshotSource", "FfmpegFileSource"):
+            return "sw"
+        return "unknown"
 
     def _debug_source(self):
         """The live source object, for /debug/decode."""
@@ -245,6 +306,61 @@ class IntrusionDetectionApp(App):
             return self._file_source
         rt = self._rt
         return None if rt is None else rt.get("src")
+
+    def _debug_app(self) -> dict:
+        """App-side counters served alongside the kernel evidence."""
+        def pct(values, q):
+            if not values:
+                return None
+            ordered = sorted(values)
+            return round(ordered[min(len(ordered) - 1, int(q * (len(ordered) - 1)))], 3)
+
+        return {
+            "decode_path": self.decode_path,
+            "decode_primary": self.decode_primary,
+            "model_frame_mode": self.model_frame,
+            "letterbox_hw_frames": self.letterbox_hw,
+            "letterbox_cpu_frames": self.letterbox_cpu,
+            "letterbox_geometry_mismatch": self._geometry_mismatch,
+            "frames": self.frame_id,
+            "fps": round(self.measured_fps(), 2),
+            "stage_ms_p50": {k: pct(v, 0.5) for k, v in self.stage_times.items()},
+            "stage_ms_p95": {k: pct(v, 0.95) for k, v in self.stage_times.items()},
+        }
+
+    def _model_canvas(self, frame, tf: LetterboxTransform):
+        """The 640x640 model input: RGA's if its geometry matches, else Python's.
+
+        The published coordinates are inverted with ``tf``, which is built from
+        ``esk.letterbox.fit_geometry``. A hardware letterbox is only usable if it
+        placed the image at exactly the same offsets and size -- otherwise every
+        box is off by the difference, silently. The two agree for every geometry
+        this platform runs, but the check is per-frame and cheap (four integer
+        comparisons), and a mismatch degrades to the verified CPU path instead of
+        publishing shifted boxes.
+        """
+        info = getattr(frame, "model_info", None)
+        canvas = getattr(frame, "model_data", None)
+        if canvas is not None and info is not None:
+            scaled_w = int(round(frame.w * info.scale))
+            scaled_h = int(round(frame.h * info.scale))
+            if (
+                canvas.shape[0] == tf.dst
+                and canvas.shape[1] == tf.dst
+                and scaled_w == tf.scaled_w
+                and scaled_h == tf.scaled_h
+                and int(info.pad_w) == int(tf.pad_x)
+                and int(info.pad_h) == int(tf.pad_y)
+            ):
+                self.letterbox_hw += 1
+                return canvas
+            if self._geometry_mismatch is None:
+                self._geometry_mismatch = {
+                    "hw": [scaled_w, scaled_h, int(info.pad_w), int(info.pad_h)],
+                    "cpu": [tf.scaled_w, tf.scaled_h, int(tf.pad_x), int(tf.pad_y)],
+                }
+        self.letterbox_cpu += 1
+        return self._letterbox(frame.data, tf)
 
     # --------------------------------------------------------------- pipeline
 
@@ -325,14 +441,26 @@ class IntrusionDetectionApp(App):
                 # the diagnostic that pipeline_ms is there to provide.
                 captured_at = time.monotonic()
                 self.frame_times.append(captured_at)
+                if self.decode_path == "unknown":
+                    self.decode_path = self._resolve_decode_path(
+                        self._debug_source()
+                    )
 
                 tf = LetterboxTransform.for_source(frame.w, frame.h, self.net_size)
-                canvas = self._letterbox(frame.data, tf)
+                canvas = self._model_canvas(frame, tf)
+                t_lb = time.monotonic()
                 self.store.put(frame.data)
+                t_store = time.monotonic()
 
                 detections = self.detector.detect(canvas, tf)
+                t_infer = time.monotonic()
                 self.inference_times.append(self.detector.last_inference_ms)
                 tracked = self.tracker.update(detections, time.monotonic())
+                t_track = time.monotonic()
+                self.stage_times["letterbox"].append((t_lb - captured_at) * 1000.0)
+                self.stage_times["store"].append((t_store - t_lb) * 1000.0)
+                self.stage_times["infer"].append((t_infer - t_store) * 1000.0)
+                self.stage_times["track"].append((t_track - t_infer) * 1000.0)
 
                 items = []
                 osd = []
@@ -378,9 +506,12 @@ class IntrusionDetectionApp(App):
                     health=self.health(),
                 )
                 self.pub.publish_detections(payload)
+                t_pub = time.monotonic()
                 # Local fan-out too: the /appcenter overlay and any WS consumer
                 # see the same frame the hub does.
                 self.emit(events=[], results=osd, ts=frame.pts)
+                self.stage_times["publish"].append((t_pub - t_track) * 1000.0)
+                self.stage_times["emit"].append((time.monotonic() - t_pub) * 1000.0)
 
                 if self._annotate_path and items and not self._annotated_written:
                     write_annotated(frame.data, payload, self._annotate_path)
@@ -425,6 +556,15 @@ class IntrusionDetectionApp(App):
             f"pipeline p50={pct(self.pipeline_times, 0.5):.2f}ms "
             f"p95={pct(self.pipeline_times, 0.95):.2f}ms, "
             f"snapshots={self.pub.snapshot_count}",
+            flush=True,
+        )
+        stages = " ".join(
+            f"{name}={pct(series, 0.5):.2f}" for name, series in self.stage_times.items()
+        )
+        print(
+            f"[intrusion] decode={self.decode_path} (primary {self.decode_primary}) "
+            f"letterbox hw={self.letterbox_hw} cpu={self.letterbox_cpu} | "
+            f"stage p50 ms: {stages}",
             flush=True,
         )
 

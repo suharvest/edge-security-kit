@@ -9,8 +9,12 @@ Same routes and the same contract as the RK3588 and generic platforms:
     a minimal page reloading that JPEG on a timer -- what
     ``status.streams[].live_url`` advertises;
 ``/debug/decode``
-    objective evidence of which decode path is live, read off the running
-    source object rather than off a health field the app filled in itself.
+    objective evidence of which frame path is live: the source object's own
+    claim *plus* what ``/proc/self`` says this process has open and mapped, so
+    the claim can be checked rather than believed (``esk/decode_evidence.py``);
+``/debug/memory``
+    a heap snapshot with deltas, for locating RSS growth from inside a process
+    whose stdout is root-only (``esk/mem_probe.py``).
 
 The one port from the RK3588 original is the encoder: that platform reaches for
 OpenCV, which is not on this Buildroot image and has no business being added to
@@ -71,7 +75,19 @@ LIVE_PAGE = """<!doctype html>
 
 
 class FrameStore:
-    """Holds the most recent decoded frame (RGB) for preview and snapshots."""
+    """Holds the most recent frame (RGB) for preview and snapshots.
+
+    The buffer is allocated once and overwritten in place. Allocating a fresh
+    ``np.array(rgb, copy=True)`` per frame means a 2.7 MB block churned six
+    times a second, which is precisely the traffic that walks glibc's dynamic
+    mmap threshold upward and stops those blocks being returned to the kernel
+    (see ``esk/mem_probe.tune_allocator``). Copying into a stable buffer removes
+    the app's own share of that churn; the allocator fix covers the rest of the
+    pipeline, which this module does not own.
+
+    A shape change (a source that renegotiates geometry mid-run) reallocates
+    once and then settles again.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -79,7 +95,9 @@ class FrameStore:
 
     def put(self, rgb: np.ndarray) -> None:
         with self._lock:
-            self._rgb = np.array(rgb, dtype=np.uint8, copy=True)
+            if self._rgb is None or self._rgb.shape != rgb.shape:
+                self._rgb = np.empty(rgb.shape, dtype=np.uint8)
+            np.copyto(self._rgb, rgb, casting="unsafe")
 
     def get(self):
         with self._lock:
@@ -178,6 +196,7 @@ class _Handler(BaseHTTPRequestHandler):
     store: FrameStore
     stream_id: str
     debug_source: object
+    debug_extra: object
 
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -222,17 +241,23 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/debug/decode":
             source = self.debug_source() if callable(self.debug_source) else self.debug_source
-            self._json(
-                json.dumps(
-                    {
-                        "decode": getattr(source, "decode_path", None),
-                        "backend_class": type(source).__name__,
-                        "decoder_cmd": getattr(source, "decoder_cmd", None),
-                        "decoder_report": getattr(source, "decoder_report", None),
-                        "source_size": getattr(source, "source_size", None),
-                    }
-                ).encode("utf-8")
-            )
+            # The interesting half of this payload is not the source object's
+            # own `decode_path` -- an app can write anything there -- but the
+            # /proc/self view underneath it, which the app does not author.
+            from esk.decode_evidence import full_report
+
+            report = full_report(source)
+            extra = self.debug_extra() if callable(self.debug_extra) else None
+            if extra:
+                report["app"] = extra
+            self._json(json.dumps(report).encode("utf-8"))
+            return
+        if path == "/debug/memory":
+            from esk.mem_probe import report
+
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            deep = "deep=1" in query
+            self._json(json.dumps(report(deep=deep)).encode("utf-8"))
             return
         if path not in ("/preview.jpg", f"/preview/{self.stream_id}.jpg"):
             self.send_error(404, "no such preview")
@@ -257,7 +282,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def start_preview_server(
-    store: FrameStore, stream_id: str, bind: str, port: int, debug_source=None
+    store: FrameStore, stream_id: str, bind: str, port: int, debug_source=None,
+    debug_extra=None,
 ) -> ThreadingHTTPServer:
     handler = type(
         "PreviewHandler",
@@ -271,6 +297,9 @@ def start_preview_server(
             "debug_source": staticmethod(debug_source)
             if callable(debug_source)
             else debug_source,
+            "debug_extra": staticmethod(debug_extra)
+            if callable(debug_extra)
+            else debug_extra,
         },
     )
     server = ThreadingHTTPServer((bind, port), handler)

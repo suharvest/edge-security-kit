@@ -2,7 +2,7 @@
   "id": "intrusion-detection",
   "name": "Intrusion Detection",
   "name_zh": "入侵检测",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "self-hosted",
   "scene": "Security",
   "scene_zh": "安防",
@@ -217,6 +217,16 @@
             "title": "Write one annotated evidence JPEG here",
             "title_zh": "写一张标注证据图到此路径",
             "default": ""
+          },
+          {
+            "key": "mem_probe",
+            "type": "integer",
+            "apply": "restart",
+            "title": "Trace allocations for /debug/memory (slower)",
+            "title_zh": "为 /debug/memory 开启分配追踪（会变慢）",
+            "min": 0,
+            "max": 1,
+            "default": 0
           }
         ]
       }
