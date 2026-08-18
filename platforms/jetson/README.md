@@ -19,6 +19,36 @@ CUDA 12.6, against the 1280×720 H.264 truth clip at 5 fps.
 | decode | `hw` (NVDEC), verified |
 | engine build time on device | 307 s |
 
+## Container image
+
+`Dockerfile` builds `edge-security-detector-jetson`, 682 MB, arm64. It is a
+plain `ubuntu:22.04` base — L4T r36.x userspace *is* Ubuntu 22.04, so the image
+needs no CUDA, no TensorRT and no L4T multimedia stack of its own, which is the
+difference between this and a multi-GB `l4t-cuda` build.
+
+Everything version-locked to the board arrives at runtime instead:
+`runtime: nvidia` injects libcuda, the `/usr/lib/aarch64-linux-gnu/nvidia` tree,
+the two L4T GStreamer plugins (`libgstnvvideo4linux2.so`, `libgstnvvidconv.so`)
+and the decoder device nodes; libnvinfer and the `tensorrt` Python package are
+bind-mounted at the private paths `/host-trt` and `/host-python`. They must not
+be mounted over the container's own `/usr/lib/aarch64-linux-gnu` or
+`/usr/lib/python3.10/dist-packages` — that hides the image's own libraries and
+numpy fails with `libblas.so.3: cannot open shared object file`.
+
+The engine is not in the image (see below); the ONNX is, at
+`/app/models/yolov8n.onnx`, so a deploy step can copy it out and build the
+engine on the target.
+
+```bash
+docker build -f platforms/jetson/Dockerfile \
+  -t <registry>/edge-security-detector-jetson:0.1.0 .
+```
+
+Verified containerised on an Orin NX 16GB: `decode: hw` through
+`nvv4l2decoder`, `/dev/v4l2-nvdec` and `/dev/nvmap` open in the container
+process, published `inference_time_ms` 4.13 — the same figure as the bare-metal
+run.
+
 ## Run
 
 ```bash
