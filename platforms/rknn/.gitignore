@@ -1,5 +1,10 @@
 .venv/
 models/*.rknn
 models/*.onnx
+# The int8-vs-fp16 comparison plates are ~300 KB each and reproducible with
+# tools/compare_annotate.py; the acceptance evidence frames are small and are
+# the record of a run that cannot be re-created, so those are kept.
 fixtures/*.jpg
+!fixtures/*-evidence-annotated.jpg
+!fixtures/*-evidence-annotated-left.jpg
 __pycache__/
