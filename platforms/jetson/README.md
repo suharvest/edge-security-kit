@@ -10,14 +10,49 @@ CUDA 12.6, against the 1280×720 H.264 truth clip at 5 fps.
 
 | | value |
 |---|---|
-| `inference_time_ms` p50 / p95 (in-pipeline, CUDA events) | **4.13 / 4.14 ms** |
-| `pipeline_ms` p50 / p95 (capture → published) | **7.24 / 7.31 ms** |
-| detector CPU | 8.5–12.5 % of one core |
-| RSS | 309 MB |
+| `inference_time_ms` p50 / p95 (in-pipeline, CUDA events) | **4.16 / 4.19 ms** |
+| `pipeline_ms` p50 / p95 (published payload field) | **6.99 / 7.03 ms** |
+| `pipeline_ms` p50 / p95 (`--stages`, capture → published) | 7.26 / 7.34 ms |
+| detector CPU | 5.5 % of one core |
+| RSS | 310 MB |
+| single-stream ceiling, one process flat out | **167 inferences/s** |
 | GPU inference ceiling, all contexts | **236 inferences/s** |
 | sustained fps | 5.0 (source-limited) |
 | decode | `hw` (NVDEC), verified |
 | engine build time on device | 307 s |
+
+Re-measured 2026-08-18: 30 s warmup, then a 120 s sample of 601 published
+payloads, `conf 0.35` / `iou 0.45`, 640 input, against the same clip. The
+detector's own summary agrees with the payload sample to the second decimal
+(`published 1187 detection messages, 5.00 fps, inference p50=4.16ms
+p95=4.19ms`), which is the check that the collector is reading what the
+detector thinks it produced.
+
+Two rows changed meaning rather than value. `pipeline_ms` is now quoted from
+the payload field, because that is the field the RK3588 board also publishes
+and the two boards are only comparable on one definition; the `--stages`
+number, which additionally covers the publish call, is kept alongside it.
+Detector CPU dropped from a previously quoted 8.5–12.5 % because that range
+came from `ps -o pcpu`, which averages over the whole process lifetime and so
+carries engine load and TensorRT warmup into a steady-state figure. 5.5 % is
+`utime+stime` deltas from `/proc/<pid>/stat` across the 120 s window, sampled
+every 5 s, and it never left 5.19–5.60 %.
+
+**Nothing had to be stopped for this.** `docker stats` during the run showed
+only this project's own RTSP fixture — `esk-jetson-rtsp-pub` 0.06 %,
+`esk-jetson-rtsp-server` 0.10 % — and the board's load average was 0.00 before
+the detector started, so the as-found and quiesced conditions the top-level
+README describes are the same state on this board. `tegrastats` at 1 s
+intervals read `GR3D_FREQ 0%` in 215 of 239 samples and never above 24 %,
+which is what a 5 fps source and a 4 ms inference should look like: a 2 %
+duty cycle that a 1 s sampler mostly misses.
+
+The single-stream ceiling is one process running flat out through
+preprocess + infer + head decode: **166.99 inferences/s over 60 s, 10020
+inferences, per-inference p50 3.82 / p95 3.83 ms**. Against the in-pipeline
+4.16 ms that loop is optimistic by 8 % — small enough that on this board a
+benchmark loop is a fair proxy, which is not true on RK3588 (see
+`platforms/rknn/README.md`).
 
 ## Container image
 
@@ -46,8 +81,8 @@ docker build -f platforms/jetson/Dockerfile \
 
 Verified containerised on an Orin NX 16GB: `decode: hw` through
 `nvv4l2decoder`, `/dev/v4l2-nvdec` and `/dev/nvmap` open in the container
-process, published `inference_time_ms` 4.13 — the same figure as the bare-metal
-run.
+process, published `inference_time_ms` 4.13 — within 0.03 ms of the bare-metal
+run, so the container costs nothing measurable on the inference path.
 
 ## Run
 
@@ -112,17 +147,17 @@ know which export they were handed.
 
 ## Where the frame time actually goes
 
-`--stages` over a 120 s run, 588 frames:
+`--stages` over a 120 s run, 1187 frames (2026-08-18):
 
 | stage | p50 | p95 | share of `pipeline_ms` |
 |---|---:|---:|---:|
-| decode (blocking appsink pull) | 190.9 ms | 196.5 ms | — |
-| letterbox (OpenCV resize + pad) | 0.84 ms | 0.90 ms | 11.7 % |
-| preprocess (HWC→NCHW, /255, into pinned) | 1.78 ms | 1.81 ms | 24.6 % |
-| infer (TensorRT, host wall) | 4.62 ms | 4.64 ms | 63.8 % |
-| postprocess (NumPy decode + NMS + tracker) | 0.43 ms | 0.44 ms | 6.0 % |
-| publish (json.dumps + MQTT) | 0.26 ms | 0.30 ms | 3.6 % |
-| **pipeline total** | **7.24 ms** | **7.31 ms** | 100 % |
+| decode (blocking appsink pull) | 191.0 ms | 196.4 ms | — |
+| letterbox (OpenCV resize + pad) | 0.75 ms | 0.79 ms | 10.3 % |
+| preprocess (HWC→NCHW, /255, into pinned) | 1.79 ms | 1.83 ms | 24.7 % |
+| infer (TensorRT, host wall) | 4.63 ms | 4.66 ms | 63.7 % |
+| postprocess (NumPy decode + NMS + tracker) | 0.43 ms | 0.45 ms | 5.9 % |
+| publish (json.dumps + MQTT) | 0.25 ms | 0.30 ms | 3.5 % |
+| **pipeline total** | **7.26 ms** | **7.34 ms** | 100 % |
 
 `decode` is excluded from the pipeline clock and is not decoder work: it is the
 blocking wait for the next frame to exist on a 5 fps source, which is why it
@@ -131,7 +166,7 @@ decode figure that starts *exceeding* the frame period is the signal that NVDEC
 has stopped keeping up.
 
 `infer` (4.62 ms host wall) is larger than the published `inference_time_ms`
-(4.13 ms) because the latter is a CUDA event pair around `execute_async_v3`
+(4.16 ms) because the latter is a CUDA event pair around `execute_async_v3`
 only, as the contract asks; the difference is the H2D/D2H copies and the host
 sync.
 
@@ -189,10 +224,12 @@ Run N copies of this detector with distinct `device_id` / `stream_id` /
 * **GPU:** eight 1080p streams at 15 fps is 120 inferences/s against the 236
   ceiling — 51 % utilization, so per-frame latency stays near the unloaded
   3.8 ms rather than climbing into the queueing regime.
-* **CPU:** measured 8.5–12.5 % of one core per stream at 5 fps 720p. Scaling
-  linearly to 15 fps 1080p gives roughly 0.5–0.7 of a core per stream, ~4–5 of
-  the 8 cores at eight streams. **Extrapolated, not measured — needs verifying
-  before anyone sells an eight-stream box on it.**
+* **CPU:** measured 5.5 % of one core per stream at 5 fps 720p (steady state,
+  `/proc` deltas). Scaling linearly to 15 fps 1080p gives roughly 0.35–0.45 of a
+  core per stream, ~3 of the 8 cores at eight streams. **Extrapolated, not
+  measured — needs verifying before anyone sells an eight-stream box on it.**
+  The earlier 8.5–12.5 % figure here was a `ps -o pcpu` lifetime average and
+  carried engine warmup into the per-stream cost.
 * **GIL:** sidestepped entirely, which is the whole point.
 * **Not verified:** NVDEC's own capacity for 8×1080p15 concurrent sessions.
   Orin NX's decoder is specified well above that in aggregate pixel rate, but
@@ -321,34 +358,47 @@ canvas identical across platforms.
 
 Same truth clip, same assertions, same hub.
 
+The Orin NX and RK3588 int8 columns are the controlled 2026-08-18 re-measurement
+described at the top of this file — same clip, same thresholds, same 30 s
+warmup and 120 s sample, payload fields on both sides. The RK3588 fp16 and
+workstation columns are earlier runs kept for shape, not part of that pairing.
+
 | | **Orin NX (this)** | RK3588 int8 | RK3588 fp16 | workstation CPU (generic) |
 |---|---:|---:|---:|---:|
-| `inference_time_ms` p50 | **4.13 ms** | 41.9 ms | 72.3 ms | 30–37 ms |
-| `pipeline_ms` p50 | **7.24 ms** | 44.3 ms | 73.1 ms | 58–72 ms |
-| back-to-back inference | 3.81 ms | 18.8 ms | 48.9 ms | — |
-| detector CPU | 8.5–12.5 % of one core | ~17 % | ~14 % | ~250 % |
-| RSS | 309 MB | 206 MB | 292 MB | — |
+| `inference_time_ms` p50 | **4.16 ms** | 36.2–44.5 ms | 72.3 ms | 30–37 ms |
+| `inference_time_ms` p95 | **4.19 ms** | 55.8–56.2 ms | 125.5 ms | — |
+| `pipeline_ms` p50 | **6.99 ms** | 38.1–46.3 ms | 73.1 ms | 58–72 ms |
+| single-stream ceiling (full loop) | **167 inf/s** | 31.4 inf/s | — | — |
+| detector CPU | 5.5 % of one core | 16.4–17.9 % | ~14 % | ~250 % |
+| RSS | 310 MB | 214 MB at start | 292 MB | — |
 | decode | `hw` (NVDEC) | `hw` (MPP) | `hw` (MPP) | `sw` (ffmpeg) |
-| accelerator headroom | 236 inf/s ceiling | NPU 8 % busy | NPU 26 % busy | — |
+| accelerator headroom | GR3D 0 % in 215/239 samples, 236 inf/s ceiling | NPU Core0 8–11 % busy | NPU 26 % busy | — |
 
-Orin NX runs inference **10× faster than RK3588 int8** and **7–9× faster than a
-20-core x86 CPU**, at a fraction of the CPU cost of the latter.
+Orin NX runs inference **9–11× faster than RK3588 int8** and **7–9× faster than
+a 20-core x86 CPU**, at a fraction of the CPU cost of the latter. The range on
+the RK3588 side is that board's window-to-window spread across four 120 s
+samples, not measurement slop in the comparison: its p95 held to ±0.2 ms while
+its p50 moved 8 ms.
 
 ### The benchmark number and the real number
 
-Unlike RK3588 — where a benchmark loop overstated per-frame speed by 2.2× —
-the two agree closely here:
+Unlike RK3588 — where the same loop overstates per-frame speed by 35–66 % once
+the head decode is left out of it — the two agree closely here:
 
 | | value |
 |---|---:|
 | `trtexec` loop, 300 iterations, no data transfers | 3.81 ms p50, 262 qps |
-| in-pipeline `inference_time_ms` (CUDA events) | 4.13 ms p50 |
+| flat-out loop, preprocess + infer + decode, 60 s | 3.82 ms p50, 167 inf/s |
+| in-pipeline `inference_time_ms` (CUDA events) | 4.16 ms p50 |
 | in-pipeline `infer` stage (host wall, incl. copies) | 4.62 ms p50 |
 
 The benchmark understates the real per-frame call by 8 %, and the full host
-stage by 21 %. Quote 4.1 ms, not 3.8, and never quote 262 qps as a stream
+stage by 21 %. Quote 4.2 ms, not 3.8, and never quote 262 qps as a stream
 capacity — the measured multi-context ceiling is **236 inferences/s**, and at
-that load per-inference latency is 31.6 ms, not 3.8.
+that load per-inference latency is 31.6 ms, not 3.8. That the trtexec loop and
+the full flat-out loop land within 0.01 ms of each other is the thing worth
+carrying to another platform: on this board the head decode is cheap enough to
+hide behind the GPU, which is exactly what does not hold on RK3588.
 
 ### Against the `industrial_security_jetson` claim
 

@@ -156,18 +156,78 @@ the board, `score` back on the workstation with pycocotools.
 
 | | A stock fp16 | B zoo fp16 | C zoo int8 |
 |---|---:|---:|---:|
-| **in-pipeline** `inference_time_ms` p50 / p95 | 72.3 / 125.5 | 66.7 / 121.1 | **41.9 / 56.5** |
-| **in-pipeline** `pipeline_ms` p50 | 73.1 | 67.5 | 44.3 |
+| **in-pipeline** `inference_time_ms` p50 / p95 | 72.3 / 125.5 | 66.7 / 121.1 | **36.2–44.5 / 55.8–56.2** |
+| **in-pipeline** `pipeline_ms` p50 | 73.1 | 67.5 | 38.1–46.3 |
 | back-to-back over 500 stills, p50 / p95 | 48.9 / 55.3 | 44.4 / 62.7 | 18.8 / 22.8 |
-| NPU Core0 @ 1.0 GHz | 26 % | 23 % | **8 %** |
-| detector CPU (one core) | ~14 % | ~18 % | ~17 % |
-| RSS after 20 s | 292 MB | 224 MB | 206 MB |
+| NPU Core0 @ 1.0 GHz | 26 % | 23 % | **8–11 %** |
+| detector CPU (one core) | ~14 % | ~18 % | 16.4–17.9 % |
+| RSS after 20 s | 292 MB | 224 MB | 214 MB |
 | sustained fps | 5.0 (source-limited) | 5.0 | 5.0 |
+
+The int8 column is the controlled 2026-08-18 re-measurement (four 120 s
+windows, see below); A and B are the earlier single runs and are kept for the
+shape of the comparison, not as same-session numbers.
 
 The two latency rows disagree by more than 2× and the top one is the real
 number. A benchmark loop amortizes weight traffic that a 5 fps stream re-pays
 on every frame (see the `core_mask` note below); quoting 18.8 ms as this
-board's per-frame latency overstates it by 2.2×.
+board's per-frame latency overstates it by 2–2.5×.
+
+### The controlled re-measurement, 2026-08-18
+
+Model C, four consecutive 120 s samples, each preceded by 30 s of warmup, same
+clip at 5 fps, `conf 0.35` / `iou 0.45`, 640 input, `pipeline_ms` and
+`inference_time_ms` read off the published payload so the figures line up with
+the Jetson board's. 600 messages per window in every case, 5.01 fps published.
+
+| window | board state | infer p50 | infer p95 | pipeline p50 | pipeline p95 | CPU | RSS |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | as-found, detector 2 days old | 36.91 | 56.12 | 39.00 | 59.86 | 17.1 % | 1850 MB |
+| 2 | as-found, detector restarted | 36.22 | 56.08 | 38.08 | 59.80 | 16.4 % | 214 MB |
+| 3 | quiesced | 39.62 | 55.80 | 41.27 | 59.60 | 16.9 % | 300 MB |
+| 4 | quiesced, repeat | 44.47 | 56.16 | 46.30 | 59.94 | 17.9 % | 338 MB |
+
+`quiesced` means the two co-tenant containers that measurably used CPU — an
+unrelated RTSP fixture pair at 3.18 % and 5.36 % of one core — were stopped for
+the run and restarted afterwards. The other six containers on the board,
+including a voice stack, all measured at or below 1.00 % of one core and were
+left alone.
+
+**Quiescing did not help.** p50 moved 8 ms in the wrong direction while p95
+stayed inside 0.4 ms across all four windows. Over the same windows the NPU held
+1.0 GHz, the DDR controller held 534 MHz, `npu-thermal` sat at 62 °C and NPU
+Core0 read 8–11 % with cores 1–2 idle, so there is no thermal or DVFS story
+behind the p50 movement either — it is this board's window-to-window spread.
+**Report RK3588 p50 as a range and lean on p95, which is the reproducible
+number.** Anyone comparing a single RK3588 p50 against another board's is
+comparing against noise of ±8 ms.
+
+RSS grows with process age: 214 MB after a minute, 338 MB after ten, 1850 MB
+after two days. Latency did not degrade with it — the two-day-old process turned
+in the fastest p50 of the four windows — but a long-lived deployment should
+expect the working set to keep climbing.
+
+### Single-stream ceiling: 31.4 inferences/s
+
+One process, flat out, preprocess + infer + head decode, 60 s, model C, with the
+pipeline detector stopped:
+
+| loop | inferences/s | infer p50 | infer p95 |
+|---|---:|---:|---:|
+| full: preprocess + infer + head decode | **31.37** | 34.24 ms | 37.26 ms |
+| pure `rknn.inference()`, no head decode | 34.78 | 26.84 ms | 37.34 ms |
+
+Both loops are measured with the same `last_inference_ms` timer around the same
+`rknn.inference()` call, so the 7.4 ms difference between them is not decode
+work being counted — it is the NumPy head decode running *between* inferences
+and slowing the inference itself, which is the same weight-traffic effect the
+5 fps stream pays. This is why the loop you pick decides the answer: against an
+in-pipeline p50 of 36.2–44.5 ms, the full loop is optimistic by 6–30 % and the
+pure-inference loop by 35–66 %.
+
+The Orin NX ceiling, measured with the identical full-loop recipe, is 167
+inferences/s. That ratio — 5.3× — is the honest single-stream comparison; the
+ratio of the two boards' pure-inference loops would flatter RK3588.
 
 Reading the in-pipeline row: the graph change is worth **8 %**, quantization a
 further **37 %**, and together they take inference from 72 ms to 42 ms and the
@@ -335,7 +395,9 @@ and is unaffected.
 
 Model **A** only, and the original acceptance run rather than the one in the
 comparison above; a repeat measured 72.3 / 125.5 ms, so treat the difference
-between 77 and 72 as this board's run-to-run spread, not as a change.
+between 77 and 72 as this board's run-to-run spread, not as a change. The
+2026-08-18 int8 re-measurement puts a number on that spread: four consecutive
+120 s windows moved p50 by 8 ms with p95 fixed to within 0.4 ms.
 
 | | RK3588 (this) | 20-core aarch64 workstation, CPU (generic) |
 |---|---|---|
@@ -360,8 +422,12 @@ Two measurements worth keeping:
   77–116 ms.** It is not CPU contention (board load average 0.60) and not DVFS
   (the NPU sits at its maximum 1.0 GHz either way). Back-to-back inference
   amortizes weight traffic that a sparse 5 fps stream pays on every frame. So a
-  benchmark loop overstates this board's real per-frame latency by roughly 2×,
-  and capacity numbers derived from one are optimistic.
+  benchmark loop overstates this board's real per-frame latency, and capacity
+  numbers derived from one are optimistic. How much it overstates depends on
+  what the loop contains: on the int8 model the 2026-08-18 re-measurement put a
+  full preprocess + infer + decode loop 6–30 % fast and a pure-inference loop
+  35–66 % fast against the same pipeline. Quote the full loop, or quote the
+  pipeline.
 * **`core_mask` does not help.** `NPU_CORE_0_1_2` moves p50 by under a
   millisecond and makes p95 worse (104 ms vs 51 ms); `/sys/kernel/debug/rknpu/load`
   shows Core0 busy and cores 1–2 idle regardless. Multi-core is for running
