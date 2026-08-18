@@ -9,7 +9,110 @@ Verified on the board on 2026-08-18: RV1126B NPU inference, the same
 run, **exit 0, no failures**. Broker, hub and detector all ran on the camera
 itself.
 
+## The camera path does not decode anything
+
+The first version of this platform pointed the detector at the device's own
+rkipc/go2rtc RTSP stream and decoded H.264 with ffmpeg on the CPU. That is an
+encode/decode round trip the camera never needed: the sensor's frames are
+already in system memory as ISP NV12 before anything encodes them, and this
+firmware publishes them on `/run/recamera/frame.sock` (the extension API's
+frame proxy, dma-buf + `SCM_RIGHTS`). The kit's capability registry selects
+`OfficialFrameSource` for that socket automatically — the app only had to stop
+overriding the source.
+
+So the question "how do we get MPP hardware decode on this board" was the wrong
+one, and its answer is anyway "you cannot": `ffmpeg -decoders` on this image
+lists `h264`, `h264_v4l2m2m`, `hevc`, `hevc_v4l2m2m` and no `*_rkmpp`; every
+`/dev/video*` node is an `rkisp`/`rkcif` capture path, not a stateful m2m
+decoder; and there is no `mppvideodec` GStreamer plugin. `librockchip_mpp.so`
+and `/dev/mpp_service` exist, so a ctypes MPP decoder is *possible*, but it
+would only ever serve the replay fixture below — the live camera has no
+bitstream to decode.
+
+Two consequences for `health.decode`:
+
+* **camera path → `hw`.** No CPU decode happens; RGA does NV12→RGB and the
+  letterbox resize. `decode` is no longer a constant in the source — it is
+  resolved from the live source object (`_resolve_decode_path`), so it cannot
+  disagree with reality.
+* **replay path (`source_file`) → `sw`,** truthfully: that fixture really is an
+  H.264 file decoded by ffmpeg on the CPU.
+
+### Kernel-side evidence, not a self-report
+
+`health.decode` is a field the app writes, so `GET /debug/decode` (preview port,
+default 8099) serves what the app does *not* author — `/proc/self`:
+
+```json
+"verdict": "zero-copy-isp",
+"evidence": {"dmabuf_fd_open": true, "mpp_device_open": false,
+             "mpp_lib_mapped": false, "ffmpeg_children": []},
+"proc_self": {
+  "open_devices": ["/dev/dma_heap/system", "/dev/null", "/dev/rga",
+                   "/dev/rknpu", "/dmabuf:"],
+  "mapped_libs": ["/oem/usr/lib/librga.so",
+                  "/oem/usr/lib/librecamera_ext.so.1.0.0",
+                  "/oem/usr/lib/librknnrt.so"],
+  "open_pipe_fds": 0},
+"capabilities": {"official_sockets": {"frame": {"exists": true}}, "euid": 0}
+```
+
+A dma-buf fd and `librecamera_ext` mapped, **zero** ffmpeg children and zero
+pipe fds: nothing in this process could be decoding a bitstream. The same
+endpoint on the replay path shows the mirror image — an `ffmpeg` child and no
+dma-buf.
+
+`/run/recamera` is `drwxr-x--- root root`, so the sockets are invisible to the
+unprivileged fleet account and the capability probe reports `exists: false` for
+all of them. That is why this had to be checked from inside an appmgr-started
+(root) app, and why `capability_probe()` reports `dir_listable` next to
+`exists`: "absent" and "not permitted to look" are different answers.
+
+## The letterbox was the expensive stage, not the decode
+
+`pipeline_ms` is measured *after* the frame read returns, so decode time was
+never in it — the 45 ms between `inference_time_ms` and `pipeline_ms` in the old
+table was Pillow resizing 1280×720 → 640×360 and padding it into a 640×640
+canvas, once per frame, in Python. `model_frame = "hw"` hands that to RGA:
+`Frame.model_data` arrives already letterboxed while `Frame.data` stays
+full-resolution for the preview, the snapshot reply and the evidence frame.
+
+The RGA geometry is checked against `esk.letterbox.fit_geometry` on every frame
+(`_model_canvas`) and only used when the scaled size and both pad offsets match
+exactly; a mismatch falls back to the Python letterbox rather than publishing
+shifted boxes. Over the runs below: 992 frames, 992 hardware, 0 fallbacks, 0
+mismatches.
+
+Stage p50, from `GET /debug/decode` → `app.stage_ms_p50` (camera path, 6 fps):
+
+| stage | before (`cpu` letterbox) | after (`hw` letterbox) |
+|---|---:|---:|
+| letterbox | ~46 ms (by difference) | **0.25 ms** |
+| frame store copy | 2.2 ms | 2.2 ms |
+| `detect()` (NPU call + NumPy head) | 44 ms | 44.3 ms |
+| tracker | 0.15 ms | 0.15 ms |
+| MQTT publish | 0.9 ms | 0.9 ms |
+| kit `emit()` | 0.45 ms | 0.45 ms |
+| **`pipeline_ms` p50 / p95** | **94.2 / 98.1 ms** | **47.4 / 50.7 ms** |
+| **CPU** | 51.5 % of one core | **27.0 %** |
+| **CPU-time per frame** | 85.8 ms | **44.9 ms** |
+
+`inference_time_ms` *rose*, 30.6 → 41.8 ms p50, and that is not noise: the
+governor is `interactive` over 594 MHz–1.608 GHz, and with the per-frame CPU
+work nearly halved the board settles at `scaling_cur_freq = 594000`. The
+host-side part of the RKNN call (input marshalling, output dequant) is CPU-bound
+and runs proportionally slower there. Per-frame *work* fell by 48 %; per-call
+*latency* on a downclocked core rose. Both numbers are above; neither alone
+describes the change.
+
+fps is unchanged at 6.0 because the frame broker, not the pipeline, sets it —
+`pipeline_ms` 47 ms would support ~21 fps.
+
 ## Measured on a reCamera Pro (RV1126B, librknnrt 2.3.2, 1280×720 H.264 @ 5 fps replay)
+
+The table below is the **replay fixture** (ffmpeg software decode of
+`truth.mp4`), which is what the cross-platform assertions run against. It is not
+the camera path; for that, see the stage table above.
 
 | | value |
 |---|---|
@@ -41,16 +144,66 @@ order of magnitude, not that RV1126B is 30 % faster than RK3588. No back-to-back
 benchmark loop was run here, so unlike the RK3588 README there is no second,
 smaller number to quote — every figure above came out of the live pipeline.
 
-`pipeline_ms` is 45 ms wider than inference because decode, letterbox, the
+`pipeline_ms` is 45 ms wider than inference because letterbox, the
 NumPy head decode and JPEG work are all on this CPU; RK3588 offloads decode and
 scaling to MPP/RGA, and Orin to NVDEC.
 
-**RSS grows about 13 MB/min** at 5 fps (373.6 → 406.6 MB over 2.5 min,
-sampled every 30 s). On a 2 GB board that is a few hours to trouble. It is not
-the app's own buffers — the frame store holds one frame and the latency series
-are bounded `deque`s — and it is not the kit's WebSocket sink, whose per-client
-queues are bounded and which had no clients attached. Unresolved; do not run
-this unattended until it is.
+## RSS growth: where it is, and where it is not
+
+**RSS grows about 12–13 MB/min** and the rate is the same on both frame paths —
+13 MB/min at 5 fps on the replay fixture, 12.3 MB/min at 6 fps on the zero-copy
+camera path (182 244 → 234 916 kB over 256 s). On a 2 GB board that is a few
+hours to trouble. `GET /debug/memory` (and `?deep=1` for the libc arena
+summary) is the probe; here is what four layers of it say, over a 4-minute
+window on the camera path:
+
+| layer | A | B | reading |
+|---|---:|---:|---|
+| `rss_kb` | 202 424 | 259 400 | +57 MB |
+| `rss_anon_kb` | 180 632 | 237 608 | all of it anonymous |
+| `gc.tracked_objects` | 48 041 | 48 527 | flat |
+| `gc.type_counts` | — | — | flat; largest delta `dict` +224 |
+| `vma.mapping_count` | 318 | 318 | **flat** |
+| `vma.heap_bytes` | 156 393 472 | 214 044 672 | **+56 MB — the whole delta** |
+| `malloc_info` `rest` (free held) | 104 116 983 | 91 298 042 | **fell 13 MB** |
+| `malloc_info` `mmap` | 5 767 168 | 5 767 168 | flat |
+
+Read together these exclude three of the four candidates and name the fourth:
+
+* **not a Python object leak** — object counts and per-type counts are flat
+  while RSS climbs 14 MB/min;
+* **not mapping accumulation** — a native library importing a dma-buf or mmapping
+  a scratch buffer per frame and never unmapping would move `mapping_count`;
+  it does not move at all;
+* **not glibc fragmentation** — the allocator's free pool *shrinks* while the
+  heap grows, so these are in-use blocks, not freed-but-unreturned ones. Tested
+  directly as well: pinning `M_MMAP_THRESHOLD` at 128 kB
+  (`malloc_tune`/`ESK_MALLOC_TUNE`, `mallopt` returning 1) made it **worse**
+  (30 MB/min) and cost 19 ms per frame in page faults. That switch is kept, off
+  by default, with the result recorded in `esk/mem_probe.tune_allocator` so the
+  hypothesis is not re-tested from scratch;
+* **it is `malloc`'d memory a C extension holds and never frees.** The
+  process's native components are `librknnrt`, `librga` and `librecamera_ext`,
+  and the growth rate is unchanged between the two frame paths — the replay path
+  loads neither `librga` nor `librecamera_ext`. The only native component common
+  to both is the RKNN runtime, reached once per frame through
+  `kit.runtime.engine.infer` → `rknn_lite.inference()`. Per-frame arithmetic
+  agrees: 12.3 MB/min at 6 fps is 34 kB per inference, 13 MB/min at 5 fps is
+  43 kB per inference — the same order, scaling with inference count rather
+  than with frame size or fps alone.
+
+Not yet proven, and what would prove it: a standalone loop calling
+`rknn_lite.inference()` on a constant array with no frame source, no MQTT and no
+preview server. That needs `/dev/rknpu`, which is root-only, so it has to be
+packaged as an appmgr app to run at all — the reason it is not in this round.
+Note that the shipped `fall-detection` app uses the same `kit.runtime.engine`
+wrapper and had been running 12 h at 263 MB when this work started, so if the
+RKNN runtime is the source it is model- or output-shape-dependent (this app's
+`rknn_model_zoo` head returns nine output tensors per frame) rather than
+universal.
+
+**Do not run this unattended until that is settled.** A supervisor restart on an
+RSS ceiling is the available mitigation today.
 
 ## End to end, against the truth video
 
