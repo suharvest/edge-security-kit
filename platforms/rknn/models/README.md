@@ -3,11 +3,24 @@
 Three models live here, built by `../tools/prepare_model.sh`. See
 `../README.md` for the accuracy and latency comparison between them.
 
-| file | ONNX | md5 of the ONNX | precision |
-|---|---|---|---|
-| `yolov8n_fp16.rk3588.rknn` | stock ultralytics, same file the generic platform uses | `eda19d19a8aa73d54411a6fc1d091c7f` | fp16 |
-| `yolov8n_zoo_fp16.rk3588.rknn` | `airockchip/rknn_model_zoo` | `2a48b1cef26b6722547807a883079f51` | fp16 |
-| `yolov8n_zoo_int8.rk3588.rknn` | `airockchip/rknn_model_zoo` | `2a48b1cef26b6722547807a883079f51` | int8, 400-image PTQ |
+| file | SoC | ONNX | md5 of the ONNX | precision |
+|---|---|---|---|---|
+| `yolov8n_fp16.rk3588.rknn` | RK3588 | stock ultralytics, same file the generic platform uses | `eda19d19a8aa73d54411a6fc1d091c7f` | fp16 |
+| `yolov8n_zoo_fp16.rk3588.rknn` | RK3588 | `airockchip/rknn_model_zoo` | `2a48b1cef26b6722547807a883079f51` | fp16 |
+| `yolov8n_zoo_int8.rk3588.rknn` | RK3588 | `airockchip/rknn_model_zoo` | `2a48b1cef26b6722547807a883079f51` | int8, 400-image PTQ |
+| `yolov8n_zoo_fp16.rk3576.rknn` | RK3576 | `airockchip/rknn_model_zoo` | `2a48b1cef26b6722547807a883079f51` | fp16 |
+| `yolov8n_zoo_int8.rk3576.rknn` | RK3576 | `airockchip/rknn_model_zoo` | `2a48b1cef26b6722547807a883079f51` | int8, same 400-image PTQ set |
+
+The RK3576 pair is built from the same ONNX and the same calibration list as
+the RK3588 pair — `--platform` is the only argument that differs — so a
+difference between the two boards cannot be attributed to a different model. A
+`.rknn` is not portable between the SoCs: `init_runtime` rejects the wrong one
+outright (`This rknn model is for RK3588, but current platform is RK3576`),
+which is the failure mode you want.
+
+The stock-ultralytics build (model A) was not repeated for RK3576. Its only job
+on RK3588 was to prove the zoo graph decodes identically to the stock one, and
+that is a property of the decoder, not of the silicon.
 
 The stock export is kept because it is byte-identical to the generic platform's
 weights: a coordinate difference between the two platforms can then never be

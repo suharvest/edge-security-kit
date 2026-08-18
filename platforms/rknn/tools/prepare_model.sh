@@ -8,9 +8,12 @@
 #
 # Three models are in play; see ../README.md for what each is for.
 #
-#   A  --graph ultralytics --dtype fp16   yolov8n_fp16.rk3588.rknn
-#   B  --graph zoo         --dtype fp16   yolov8n_zoo_fp16.rk3588.rknn
-#   C  --graph zoo         --dtype int8   yolov8n_zoo_int8.rk3588.rknn
+#   A  --graph ultralytics --dtype fp16   yolov8n_fp16.<platform>.rknn
+#   B  --graph zoo         --dtype fp16   yolov8n_zoo_fp16.<platform>.rknn
+#   C  --graph zoo         --dtype int8   yolov8n_zoo_int8.<platform>.rknn
+#
+# <platform> is --platform, rk3588 (default) or rk3576. Nothing else about the
+# conversion changes between them, including the calibration list.
 #
 # int8 additionally needs --calib-dir: a directory of images on the *builder*,
 # turned into the path list RKNN's build(dataset=...) reads. Build it with
