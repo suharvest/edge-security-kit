@@ -60,7 +60,7 @@ from esk.letterbox import (
     frame_norm_to_pixels,
     pad_into_canvas,
 )
-from esk.preview import FrameStore, start_preview_server
+from esk.preview import FrameStore, encode_jpeg, start_preview_server
 from esk.publisher import Publisher
 from esk.tracker import IoUTracker
 from esk.zoo_head import PERSON_CLASS_NAME, PersonDetector
@@ -454,7 +454,15 @@ def write_annotated(rgb: np.ndarray, payload: dict, path: str) -> None:
         f"decode={payload['health']['decode']} frame_id={payload['frame_id']}",
         fill=(0, 200, 255),
     )
-    img.save(path, format="JPEG", quality=92)
+    # Same encoder the preview and snapshot paths use: Pillow cannot write JPEG
+    # on this firmware (libjpeg 8 runtime under a Pillow built for 9), so the
+    # evidence frame would be the one artefact that never got produced.
+    data = encode_jpeg(np.asarray(img, dtype=np.uint8), max_bytes=4 * 1024 * 1024)
+    if data is None:
+        print(f"[intrusion] annotated frame encode failed for {path}", flush=True)
+        return
+    with open(path, "wb") as fh:
+        fh.write(data)
     print(f"[intrusion] annotated evidence frame written to {path}", flush=True)
 
 

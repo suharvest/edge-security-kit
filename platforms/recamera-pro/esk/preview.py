@@ -25,6 +25,7 @@ reason to serve the padded/scaled version.
 from __future__ import annotations
 
 import io
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -85,6 +86,60 @@ class FrameStore:
             return None if self._rgb is None else self._rgb.copy()
 
 
+#: PIL quality -> ffmpeg mjpeg ``-q:v`` (2 best, 31 worst). Only used when
+#: Pillow's JPEG encoder is unusable; see :func:`_pillow_jpeg_works`.
+_FFMPEG_Q = {85: 3, 70: 6, 55: 9, 40: 13, 25: 20}
+
+_pillow_jpeg: "bool | None" = None
+
+
+def _pillow_jpeg_works() -> bool:
+    """Can this Pillow actually WRITE a JPEG?
+
+    On the reCamera Pro firmware it cannot: the bundled Pillow 9.4.0 was
+    compiled against libjpeg 9 while the image ships libjpeg 8, so every save
+    dies with ``Wrong JPEG library version: library is 80, caller expects 90``
+    -> ``OSError: encoder error -2``. ``PIL.features`` reports "JPEG support ok,
+    compiled for 9.0" and is therefore useless as a check -- the only reliable
+    probe is to encode something. Decoding, resizing and PNG all work, so this
+    is scoped to the encoder alone and evaluated once per process.
+    """
+    global _pillow_jpeg
+    if _pillow_jpeg is None:
+        try:
+            from PIL import Image
+
+            buf = io.BytesIO()
+            Image.new("RGB", (8, 8)).save(buf, format="JPEG", quality=80)
+            _pillow_jpeg = buf.tell() > 0
+        except Exception:
+            _pillow_jpeg = False
+    return _pillow_jpeg
+
+
+def _encode_jpeg_ffmpeg(rgb: np.ndarray, quality: int):
+    """JPEG-encode RGB through ffmpeg, for images Pillow refuses to write.
+
+    ffmpeg is on the device because the frame source already needs it, and it
+    links its own JPEG encoder, so it is unaffected by the libjpeg mismatch.
+    """
+    h, w = rgb.shape[:2]
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-i", "-",
+        "-frames:v", "1", "-q:v", str(_FFMPEG_Q.get(quality, 6)),
+        "-f", "image2", "-vcodec", "mjpeg", "-",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, input=np.ascontiguousarray(rgb).tobytes(),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
+        )
+    except Exception:
+        return None
+    return proc.stdout or None
+
+
 def encode_jpeg(rgb: np.ndarray, max_bytes: int = SNAPSHOT_MAX_BYTES):
     """Encode RGB to JPEG under ``max_bytes``, dropping quality then resolution.
 
@@ -93,6 +148,7 @@ def encode_jpeg(rgb: np.ndarray, max_bytes: int = SNAPSHOT_MAX_BYTES):
     """
     from PIL import Image
 
+    use_pillow = _pillow_jpeg_works()
     base = Image.fromarray(np.ascontiguousarray(rgb), mode="RGB")
     for downscale in (1.0, 0.75, 0.5, 0.35, 0.25):
         if downscale == 1.0:
@@ -103,10 +159,15 @@ def encode_jpeg(rgb: np.ndarray, max_bytes: int = SNAPSHOT_MAX_BYTES):
                 Image.BILINEAR,
             )
         for quality in (85, 70, 55, 40, 25):
-            buf = io.BytesIO()
-            current.save(buf, format="JPEG", quality=quality)
-            if buf.tell() <= max_bytes:
-                return buf.getvalue()
+            if use_pillow:
+                buf = io.BytesIO()
+                current.save(buf, format="JPEG", quality=quality)
+                if buf.tell() <= max_bytes:
+                    return buf.getvalue()
+                continue
+            data = _encode_jpeg_ffmpeg(np.asarray(current, dtype=np.uint8), quality)
+            if data is not None and len(data) <= max_bytes:
+                return data
     return None
 
 
