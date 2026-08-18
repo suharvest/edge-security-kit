@@ -1,0 +1,7 @@
+{
+  "schema": "sensecraft.status/1",
+  "timestamp": 1787023434976,
+  "session_id": "1787023389599",
+  "device_id": "orin-nx-01",
+  "online": false
+}

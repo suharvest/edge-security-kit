@@ -1,0 +1,40 @@
+# Jetson Orin TensorRT detector configuration. Copy to config.yaml and edit.
+device_id: orin-nx-01
+stream_id: cam-0
+
+# RTSP URL. Use a non-square source: a square one passes even when the
+# letterbox inverse is missing entirely.
+source: rtsp://127.0.0.1:8556/edge-sec-truth
+rtsp_transport: tcp
+rtsp_codec: h264
+rtsp_latency_ms: 100
+
+# This platform decodes on NVDEC via nvv4l2decoder.
+decode_primary: hw
+# Refuse to start on the CPU decoder. On a box bought for its GPU, a silent
+# ffmpeg fallback is the failure that looks like success. Set false only if a
+# degraded stream really is better than none.
+require_hw_decode: true
+
+# A TensorRT engine is only valid for the exact TensorRT version and GPU that
+# built it. Build it on the target device with tools/build_engine.sh; nothing
+# under models/ is shipped in the repository.
+model: models/yolov8n_fp16.orin.engine
+input_size: 640
+conf_threshold: 0.35
+iou_threshold: 0.45
+
+track_iou_threshold: 0.2
+track_max_lost_s: 0.75
+
+mqtt_host: 127.0.0.1
+mqtt_port: 1883
+topic_prefix: sensecraft/security
+status_interval_s: 30
+
+preview_enabled: true
+preview_bind: 0.0.0.0
+preview_port: 8099
+# Address a browser can actually reach. Left empty, preview_url and live_url
+# are omitted rather than advertised wrongly.
+preview_advertise_host: ""

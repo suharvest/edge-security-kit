@@ -1,0 +1,38 @@
+[project]
+name = "esk-jetson"
+version = "0.1.0"
+description = "Jetson Orin TensorRT person detector publishing sensecraft.detection/1"
+requires-python = ">=3.10"
+# tensorrt and PyGObject are NOT listed: both must come from the board. The
+# TensorRT Python bindings ship with JetPack and have to match the installed
+# libnvinfer, and the GStreamer bindings have to match the system GStreamer
+# (nvv4l2decoder lives in the L4T plugin set). The venv is created with
+# --system-site-packages so they resolve from the OS; pinning them here would
+# install a second, mismatched copy -- and there is no aarch64 tensorrt wheel
+# on PyPI that matches JetPack anyway.
+dependencies = [
+    "cuda-python>=12.2,<13",
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+    "paho-mqtt>=1.6,<2.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+esk-jetson = "esk_jetson.__main__:main"
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4.21",
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["esk_jetson"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

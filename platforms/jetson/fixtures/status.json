@@ -1,0 +1,28 @@
+{
+  "schema": "sensecraft.status/1",
+  "timestamp": 1787023580168,
+  "session_id": "1787023549761",
+  "device_id": "orin-nx-01",
+  "online": true,
+  "streams": [
+    {
+      "stream_id": "cam-0",
+      "state": "running",
+      "fps": 5.0,
+      "decode": "hw",
+      "preview_url": "http://100.82.225.102:8099/preview/cam-0.jpg",
+      "live_url": "http://100.82.225.102:8099/live/cam-0"
+    }
+  ],
+  "health": {
+    "fps": 5.0,
+    "decode": "hw",
+    "backend": "tensorrt-10.3.0",
+    "fallback_active": false
+  },
+  "versions": {
+    "app": "0.1.0",
+    "model": "yolov8n_fp16.orin@507e44814947"
+  },
+  "uptime_s": 30.4
+}

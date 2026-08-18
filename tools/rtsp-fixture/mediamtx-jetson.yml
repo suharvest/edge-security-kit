@@ -1,0 +1,39 @@
+# RTSP-only mediamtx for the on-board Jetson fixture.
+#
+# Every listener is either moved off its default or switched off, so this can
+# be brought up on a shared board without colliding with anything already
+# there. Only RTSP/TCP is needed -- the detector's NVDEC pipeline requests TCP
+# interleaved -- but the UDP RTP/RTCP ports still get bound, so they are moved
+# too.
+#
+# Every protocol toggle is written as an explicit `false`. `no` is not a
+# reliable spelling here: mediamtx parses with Go's yaml.v3, which follows YAML
+# 1.2 and reads `no` as the *string* "no" rather than as false.
+#
+# The one that is easy to miss is `moq` (Media over QUIC, added in v1.20): it is
+# not in older example configs, defaults to true, and binds :8892 -- which the
+# other mediamtx on this board already owns. The symptom is a container that
+# reports `[RTSP] started with listeners on :8556` and then exits anyway, so the
+# RTSP line in the log is not evidence that the server came up.
+rtsp: true
+rtspAddress: :8556
+rtspTransports: [tcp]
+rtpAddress: :18600
+rtcpAddress: :18601
+multicastRTPPort: 18602
+multicastRTCPPort: 18603
+rtspsAddress: :18604
+srtpAddress: :18605
+srtcpAddress: :18606
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false
+api: false
+metrics: false
+pprof: false
+playback: false
+logLevel: info
+paths:
+  edge-sec-truth:

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+config.yaml
+# TensorRT engines are device- and version-specific build products, never
+# repository content. Rebuild with tools/build_engine.sh on the target.
+models/*.engine
+models/*.onnx
+models/*.timing.cache
+evidence/
