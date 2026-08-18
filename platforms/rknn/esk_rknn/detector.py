@@ -1,4 +1,4 @@
-"""RK3588 detector: MPP decode -> RKNN person detection -> MQTT detections.
+"""RKNPU2 detector: MPP decode -> RKNN person detection -> MQTT detections.
 
 Publishes ``sensecraft.detection/1`` and ``sensecraft.status/1`` byte-for-byte
 compatible with the generic reference implementation, answers ``cmd/snapshot``

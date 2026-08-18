@@ -1,5 +1,5 @@
 #!/bin/sh
-# Push the detector to an RK3588 board and bring it up.
+# Push the detector to an RK3588 or RK3576 board and bring it up.
 #
 # Deliberately additive: it creates one directory tree under $HOME on the board
 # and starts one process matched on this project's own config path. It never

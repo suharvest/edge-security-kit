@@ -260,7 +260,7 @@ def decode_zoo_head(
 
 
 class RKNNPersonDetector:
-    """YOLOv8n .rknn restricted to COCO class 0, on the RK3588 NPU."""
+    """YOLOv8n .rknn restricted to COCO class 0, on an RKNPU2 NPU."""
 
     def __init__(
         self,

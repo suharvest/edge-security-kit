@@ -1,8 +1,12 @@
-# RK3588 NPU person detector. arm64 only.
+# RKNPU2 NPU person detector (RK3588 and RK3576). arm64 only.
+#
+# One image serves both SoCs: the code does not branch on the chip, so the only
+# difference is which model file the config points at. Both are carried, and the
+# runtime rejects a mismatched one at init_runtime rather than running it wrongly.
 #
 # Build from the repository root:
 #   docker build -f platforms/rknn/Dockerfile \
-#     -t <registry>/edge-security-detector-rk3588:0.1.0 .
+#     -t <registry>/edge-security-detector-rknpu2:0.1.0 .
 #
 # What this image deliberately does NOT contain
 # ---------------------------------------------
@@ -71,8 +75,8 @@ RUN pip install --no-cache-dir --break-system-packages uv \
 
 FROM debian:${DEBIAN_TAG}
 
-LABEL org.opencontainers.image.title="edge-security-detector-rk3588" \
-      org.opencontainers.image.description="RK3588 NPU person detector for edge-security-kit: RTSP in over the Rockchip MPP hardware decoder, sensecraft.detection/1 over MQTT out, with a JPEG preview endpoint. The RKNN runtime and the MPP plugin are mounted from the board, not bundled." \
+LABEL org.opencontainers.image.title="edge-security-detector-rknpu2" \
+      org.opencontainers.image.description="RKNPU2 (RK3588 / RK3576) NPU person detector for edge-security-kit: RTSP in over the Rockchip MPP hardware decoder, sensecraft.detection/1 over MQTT out, with a JPEG preview endpoint. The RKNN runtime and the MPP plugin are mounted from the board, not bundled." \
       org.opencontainers.image.version="0.1.0" \
       org.opencontainers.image.source="https://github.com/suharvest/edge-security-kit" \
       org.opencontainers.image.licenses="Apache-2.0" \
@@ -111,11 +115,13 @@ COPY --from=builder /opt/venv /opt/venv
 COPY platforms/rknn/esk_rknn/ /app/esk_rknn/
 COPY platforms/rknn/models/yolov8n_zoo_int8.rk3588.rknn \
      platforms/rknn/models/yolov8n_zoo_fp16.rk3588.rknn \
+     platforms/rknn/models/yolov8n_zoo_int8.rk3576.rknn \
+     platforms/rknn/models/yolov8n_zoo_fp16.rk3576.rknn \
      platforms/rknn/models/SHA256SUMS \
      /app/models/
 
 RUN cd /app/models \
- && grep -E 'yolov8n_zoo_(int8|fp16)\.rk3588\.rknn$' SHA256SUMS | sha256sum -c - \
+ && grep -E 'yolov8n_zoo_(int8|fp16)\.rk3(588|576)\.rknn$' SHA256SUMS | sha256sum -c - \
  && rm -f SHA256SUMS
 
 # Sanity-check what the image itself owns. rknnlite and mppvideodec are

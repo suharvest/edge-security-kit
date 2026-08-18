@@ -1,4 +1,4 @@
-"""RK3588 / RKNN person detector for edge-security-kit."""
+"""RKNPU2 person detector for edge-security-kit (RK3588 and RK3576)."""
 
 __all__ = [
     "config",

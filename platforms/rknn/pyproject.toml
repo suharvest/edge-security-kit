@@ -1,7 +1,7 @@
 [project]
 name = "esk-rknn"
 version = "0.1.0"
-description = "RK3588 RKNN person detector publishing sensecraft.detection/1"
+description = "RKNPU2 (RK3588 / RK3576) person detector publishing sensecraft.detection/1"
 requires-python = ">=3.10"
 # rknn-toolkit-lite2 and PyGObject are NOT listed: both must come from the
 # board (the RKNN user library has to match the kernel NPU driver, and the

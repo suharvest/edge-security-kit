@@ -1,4 +1,11 @@
-"""Runtime configuration for the RK3588 RKNN detector."""
+"""Runtime configuration for the RKNPU2 detector (RK3588 / RK3576).
+
+The chip is not a setting. Nothing in this module or in the pipeline branches
+on it: the only per-chip input is which ``.rknn`` ``model`` points at, and the
+runtime refuses a model built for the other SoC at ``init_runtime`` rather than
+running it wrongly. ``config.example.yaml`` and ``config.rk3576.example.yaml``
+differ in exactly that line and in ``device_id``.
+"""
 
 from __future__ import annotations
 
@@ -33,8 +40,9 @@ class Config:
     input_size: int = 640
     conf_threshold: float = 0.35
     iou_threshold: float = 0.45
-    # RKNNLite core mask. None lets the runtime schedule; RK3588 has three NPU
-    # cores and a single-stream detector does not benefit from pinning.
+    # RKNNLite core mask. None lets the runtime schedule. RK3588 has three NPU
+    # cores and RK3576 two; on both, only Core0 is ever busy for one small model,
+    # so a single-stream detector does not benefit from pinning.
     npu_core_mask: int | None = None
 
     # Tracking

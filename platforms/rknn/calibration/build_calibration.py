@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the PTQ calibration set for the RK3588 int8 detector.
+"""Build the PTQ calibration set for the RKNPU2 int8 detector.
 
 Post-training quantization only needs pixels, not labels: the toolkit runs the
 float graph over the set and records per-tensor activation ranges. Those ranges

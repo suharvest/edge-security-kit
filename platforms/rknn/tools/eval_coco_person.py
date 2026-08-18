@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""COCO person-class AP for the RK3588 .rknn models.
+"""COCO person-class AP for the RKNPU2 .rknn models.
 
 Three subcommands, because the three steps run on three different machines and
 nothing but small files crosses between them:
