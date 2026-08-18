@@ -1,0 +1,3 @@
+models/*.rknn
+__pycache__/
+*.pyc
