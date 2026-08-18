@@ -4,29 +4,216 @@ Hub-mode detector for reCamera Pro, packaged as a reCamera app rather than a
 container: the device runs Buildroot with no Docker, and its NPU is reached
 through the on-device app manager.
 
-## Status
+Verified on the board on 2026-08-18: RV1126B NPU inference, the same
+`tools/rtsp-fixture/verify_e2e.py` assertions the RK3588 and Orin NX platforms
+run, **exit 0, no failures**. Broker, hub and detector all ran on the camera
+itself.
 
-**The model is converted and the app is written; it has not run on the board.**
-Two things block an on-device run, both of them environmental rather than
-code:
+## Measured on a reCamera Pro (RV1126B, librknnrt 2.3.2, 1280×720 H.264 @ 5 fps replay)
 
-- `/dev/rknpu` is `root`-only and the fleet account is uid 1000. The supported
-  root path is the device's app manager, which is single-active by design:
-  activating this app stops whatever app is currently running.
-- The device sits on a different overlay network from the hub used for
-  testing, with no route between them.
+| | value |
+|---|---|
+| `inference_time_ms` p50 / p95 (in-pipeline) | **29.9 / 32.3 ms** |
+| `pipeline_ms` p50 / p95 (capture → published) | **74.7 / 90.4 ms** |
+| detector CPU | 38–40 % of one core |
+| detector RSS | 247 MB after 5 min, 408 MB after 20 min — **grows, see below** |
+| sustained fps | 5.0 (source-limited), 651 msgs / 130.0 s = 5.01/s |
+| decode | `sw` (ffmpeg), the only userspace path on this firmware |
+| capture → alert p50 / p95 | 111.7 / 299.6 ms |
 
-Nothing here is estimated. There are no performance numbers, no captured
-payloads and no accuracy figures for this platform, and there will not be any
-until it runs on the board.
+Against the other two platforms, same clip, same assertions:
 
-## What is verified
+| | Orin NX (TensorRT fp16) | RK3588 (RKNN int8) | **reCamera Pro (RKNN int8)** |
+|---|---:|---:|---:|
+| `inference_time_ms` p50 | 4.13 ms | 41.9 ms | **29.9 ms** |
+| `inference_time_ms` p95 | 4.14 ms | 56.5 ms | **32.3 ms** |
+| `pipeline_ms` p50 | 7.24 ms | 44.3 ms | **74.7 ms** |
+| detector CPU | 8.5–12.5 % of one core | 21 % | **38–40 %** |
+| RSS | 309 MB | 206 MB | **247 MB rising** |
+| decode | NVDEC (`hw`) | MPP (`hw`) | ffmpeg (`sw`) |
 
-- `yolov8n` zoo ONNX converted to RV1126B int8, `librknnc 2.3.2` matching the
-  board's `librknnrt 2.3.2`. Every Conv/Split/Add/Concat is placed on the NPU;
-  only the input and the nine output operators sit on the CPU.
-- The letterbox inverse round-trips exactly on host, and the tracker's first id
-  is 1, as the contract requires.
+The inference figure beating RK3588's int8 is not a faster NPU. Both rows are
+in-pipeline `inference_time_ms`, but the two boards run different models:
+RK3588's 41.9 ms is YOLOv8n at 640×640 against a **live** MPP pipeline whose
+weight traffic is re-paid per frame, while this row is the same 640×640 graph
+on a board doing nothing else. The honest reading is that they are the same
+order of magnitude, not that RV1126B is 30 % faster than RK3588. No back-to-back
+benchmark loop was run here, so unlike the RK3588 README there is no second,
+smaller number to quote — every figure above came out of the live pipeline.
+
+`pipeline_ms` is 45 ms wider than inference because decode, letterbox, the
+NumPy head decode and JPEG work are all on this CPU; RK3588 offloads decode and
+scaling to MPP/RGA, and Orin to NVDEC.
+
+**RSS grows about 13 MB/min** at 5 fps (373.6 → 406.6 MB over 2.5 min,
+sampled every 30 s). On a 2 GB board that is a few hours to trouble. It is not
+the app's own buffers — the frame store holds one frame and the latency series
+are bounded `deque`s — and it is not the kit's WebSocket sink, whose per-client
+queues are bounded and which had no clients attached. Unresolved; do not run
+this unattended until it is.
+
+## End to end, against the truth video
+
+`tools/rtsp-fixture/verify_e2e.py`, 130 s observation, hub and broker on the
+camera. Truth line at x=0.5 (no `ESK_LINE_X` nudge — this platform decodes at
+full resolution in software, so published `cx` is not quantized to the 1/640
+grid that put the RK3588 centroid exactly on the line).
+
+| assertion | tolerance | measured |
+|---|---|---|
+| `line_cross` instants (×8) | ±0.5 s | 0.036 – 0.225 s |
+| `line_cross` direction | exact | 8/8 correct |
+| `line-fwd` fired on a backward crossing | none | **NONE** (4 alerts, all forward) |
+| `line-bwd` fired on a forward crossing | none | **NONE** (4 alerts, all backward) |
+| `zone_enter` instants (×4) | ±0.5 s | 0.009 – 0.010 s |
+| `loitering` dwell (configured 10 s) | ≤1 s | 10.00 – 10.01 s |
+| `loitering` first-fire instant | ±0.5 s | 0.010 – 0.019 s |
+| snapshots | real JPEG | 8/8, `image/jpeg`, 44.4 – 46.3 KB |
+| trajectory alignment vs `truth.json` | — | mean \|cx\| err 0.00231, p95 0.00447, max 0.02401 |
+| stream continuity | — | 651 msgs / 130.0 s, gap p50 199 ms max 442 ms, one track id |
+
+`fixtures/` holds the payloads captured off the broker during that run, all
+three passing `contracts/validate_payload.py`.
+
+## The NPU is actually running
+
+`health.backend` is the process describing itself, which proves nothing. The
+independent parts:
+
+* the vendor runtime reports what it opened, not what the app claims —
+  `RKNN Driver Information, version: 0.9.8` and
+  `RKNN Model Information, ... target platform: rv1126b` come out of
+  `librknnrt` after the driver ioctl succeeds;
+* the negative control: the same package, same model, launched as the
+  unprivileged fleet account instead of through appmgr, fails at
+  `init_runtime` with
+  `failed to open rknpu module, need to insmod rknpu dirver!` →
+  `RKNN_ERR_FAIL`. `/dev/rknpu` is `crw------- root root`, so a run that
+  reaches inference at all has opened it.
+
+`/sys/class/devfreq/22000000.npu/load` is world-readable but reads
+`100@800000000Hz` with the detector running **and** with no app running at all,
+so on this kernel it is not a busy/idle discriminator. Do not cite it.
+
+## Running it on the board
+
+The device has no Docker, no root shell for the fleet account, and no MQTT
+broker or hub of its own. All three parts run on the camera; a laptop only
+opens the hub in a browser.
+
+### Broker and hub
+
+Both go in their own venv — **never into `/userdata/rknnenv`**, which is the app
+runtime.
+
+```sh
+python3 -m venv /userdata/esk-hubenv
+/userdata/esk-hubenv/bin/pip install amqtt "aiohttp>=3.9" aiomqtt bcrypt \
+    jsonschema "paho-mqtt<2" sqlean.py
+```
+
+Three firmware facts this has to work around:
+
+* **No MQTT broker.** The image ships `mosquitto_pub`/`_sub` but no
+  `mosquitto`. `amqtt` is pure Python and installs from PyPI.
+* **No `sqlite3` in CPython.** The image has no `_sqlite3` extension and no
+  libsqlite3 at all, so `import sqlite3` fails and the hub cannot start.
+  `sqlean.py` is a DB-API 2.0 module with SQLite statically linked and an
+  aarch64 wheel; a `sitecustomize.py` in the venv aliases it into
+  `sys.modules["sqlite3"]` before anything imports the stdlib name. Scoped to
+  the venv.
+* **amqtt 0.12.0 leaks retained messages across subscribers.** On CONNECT it
+  replays retained messages for every filter in the broker-wide registry, not
+  the connecting client's own, so a client subscribed to `.../detections/+`
+  is handed the retained `.../status` message and any consumer that assumes the
+  topic filter held will misparse it. One-line fix in `Broker.client_connected`:
+  skip filters this session does not hold.
+
+Then, with the broker on 1884 and the hub on 18080:
+
+```sh
+MQTT_HOST=127.0.0.1 MQTT_PORT=1884 HUB_HTTP_PORT=18080 \
+  HUB_ADMIN_PASSWORD=... HUB_WEB_DIR=<web/dist> \
+  /userdata/esk-hubenv/bin/python -m edge_hub --data-dir /userdata/esk-hubdata
+```
+
+### The detector
+
+`/dev/rknpu` is root-only and the fleet account is uid 1000, so the app has to
+go through the device's app manager, which is **single-active**: activating it
+stops whatever app is currently running. Record the current `active_app` first
+and put it back afterwards.
+
+Packages must be signed — `POST /api/appMgr/install` refuses an unsigned one
+with *"package is unsigned and signature verification is required"* — so build
+the tar with `manifest.json` at the **top level** (not inside a directory) and
+sign it with the release key before pushing:
+
+```sh
+tar -czf intrusion-detection.tar.gz manifest.json app.py esk models
+python3 <recamera_pro>/market/packaging/sign.py --dist . --pkg intrusion-detection.tar.gz
+# POST /api/appMgr/install {"path": "/userdata/.../intrusion-detection.tar.gz"}
+# POST /api/appMgr/config  {"id": "intrusion-detection", "config": {...}}
+# POST /api/appMgr/switch  {"id": "intrusion-detection"}
+```
+
+Everything the app needs is in the manifest's `config_schema`: `mqtt_host`,
+`mqtt_port`, `device_id`, `stream_id`, `source_file` (replay instead of the
+sensor), `annotate_path`, `preview_port`. appmgr owns the environment, so the
+`ESK_*` variables only reach headless runs.
+
+The app writes stdout to `<app_dir>/logs/app.log`, which is root-owned and
+unreadable from the fleet account; appmgr exposes no log endpoint either. A
+failed start shows only `last_exit.code` in `/api/appMgr/list`. Diagnosing the
+first three failures needed a temporary package whose `app.py` `dup2`s its own
+stdout/stderr to a world-readable path.
+
+## What the board changed in this code
+
+Three defects that only a real run could surface, all fixed here:
+
+* `esk/file_source.py` probed the clip size with `ffprobe`. The image ships
+  `ffmpeg` **without** `ffprobe`, so replay — the whole reason this module
+  exists — could never have worked on the one platform it was written for. It
+  now falls back to parsing `ffmpeg -i`'s stream line.
+* Pillow cannot write JPEG on this firmware: the bundled Pillow 9.4.0 was built
+  against libjpeg 9 and the image ships libjpeg 8, so every save dies with
+  `Wrong JPEG library version: library is 80, caller expects 90` →
+  `OSError: encoder error -2`. `PIL.features` cheerfully reports "JPEG support
+  ok", so the check is an actual encode, once per process; the fallback shells
+  out to `ffmpeg`, which links its own encoder. This affects the preview
+  endpoint, the snapshot reply and the annotated evidence frame — i.e. every
+  image the hub can ask for.
+* `tools/rtsp-fixture/verify_e2e.py` now scopes alerts to the observation
+  window and fetches them at tap close. On a fast host the harness's brute-force
+  trajectory alignment takes seconds; here it takes ~5 minutes, during which the
+  hub keeps firing, and those extra alerts were being zipped against truth
+  crossings — reporting a clean run as eight wrong directions with −25 s errors.
+
+## Coordinates
+
+The model input is square, the source is not, so the frame is scaled with its
+aspect preserved and padded, and the pad is reversed before publishing;
+`coordinate_space` is the literal `frame_norm`, normalized against the original
+1280×720 frame.
+
+`fixtures/evidence-annotated.jpg` is one frame with the boxes **redrawn from the
+published `frame_norm` values**, not from the detector's internal pixel boxes —
+a wrong inverse shows up as a squashed or offset rectangle rather than as a
+plausible number. The clip composites a 297×662 person patch at y=58, so the
+drawing can be checked against arithmetic instead of taste:
+
+| | truth patch | from the published bbox | delta |
+|---|---:|---:|---:|
+| box top | 58 px | 55.7 px | −2.3 px |
+| box bottom | 720 px | 718.9 px | −1.1 px |
+| box height | 662 px | 663.2 px | +1.2 px |
+
+The padded axis here is the vertical one (720 → 360 inside a 640-tall canvas),
+which is exactly where an unreversed pad would show: it would put the box 140 px
+out, not 2 px. The residual is the detector boxing the person rather than the
+patch rectangle. Width is 274 px against the patch's 297 for the same reason —
+the body does not fill the patch's width.
 
 ## Layout
 
@@ -44,4 +231,11 @@ application tree; `manifest.json` is what the device's app manager consumes.
 
 Binaries are not committed. `models/SHA256SUMS` pins what was built; regenerate
 with the RK3588 conversion chain in `../rknn/tools/`, passing the `rv1126b`
-platform and the same 400-image calibration list.
+platform and the same 400-image calibration list. `yolov8n` zoo ONNX converted
+to RV1126B int8, `librknnc 2.3.2` matching the board's `librknnrt 2.3.2`; every
+Conv/Split/Add/Concat is placed on the NPU, only the input and the nine output
+operators sit on the CPU.
+
+No accuracy sweep has been run on this platform. The RK3588 COCO numbers do not
+transfer: same ONNX and the same calibration list, but a different quantizer
+target.

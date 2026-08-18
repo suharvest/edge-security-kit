@@ -25,14 +25,14 @@ coordinates, so they survive a change of resolution.
 
 Same 1280×720 H.264 source, same truth video, same assertions.
 
-| | Jetson Orin NX 16GB | Radxa Rock 5T (RK3588) |
-|---|---|---|
-| Accelerator | TensorRT 10.3, FP16 | RKNN 2.3.2, int8 |
-| Inference p50, in pipeline | 4.13 ms | 41.9 ms |
-| Full pipeline p50 | 7.24 ms | 44.3 ms |
-| Detector CPU | 8.5–12.5% of one core | 21% of one core |
-| Decode | NVDEC, confirmed in-kernel | Rockchip MPP, confirmed in-kernel |
-| Single-stream ceiling | 167 inferences/s | not measured |
+| | Jetson Orin NX 16GB | Radxa Rock 5T (RK3588) | reCamera Pro (RV1126B) |
+|---|---|---|---|
+| Accelerator | TensorRT 10.3, FP16 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 |
+| Inference p50, in pipeline | 4.13 ms | 41.9 ms | 29.9 ms |
+| Full pipeline p50 | 7.24 ms | 44.3 ms | 74.7 ms |
+| Detector CPU | 8.5–12.5% of one core | 21% of one core | 38–40% of one core |
+| Decode | NVDEC, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | ffmpeg, software (no userspace MPP) |
+| Single-stream ceiling | 167 inferences/s | not measured | not measured |
 
 The hub costs 3.7% of one core and 52.8 MB RSS on the RK3588 board while that
 board also runs a detector, so the aggregation host does not need to be a
@@ -59,7 +59,7 @@ platforms/
   jetson/      NVDEC + TensorRT, all Python
   rknn/        MPP + RGA + RKNN, int8 and fp16
   generic/     CPU / ONNX Runtime, the reference implementation and test rig
-  recamera-pro/ RV1126B, model converted and app written, never run on hardware
+  recamera-pro/ RV1126B, RKNN int8 on the camera itself, broker and hub included
 tools/
   rtsp-fixture/ mediamtx, the truth-video generator and the acceptance harness
 ```
@@ -95,9 +95,10 @@ centroid sat on the line and no sign flip occurred.
 ## Status
 
 Jetson, RK3588 and the hub are verified on hardware, including containerised
-deployment. reCamera Pro has a converted model and a written app but has never
-executed on the board — `/dev/rknpu` is root-only there and the supported root
-path stops whatever app is currently running. It carries no performance or
-accuracy numbers, and will not until it runs.
+deployment. reCamera Pro is verified too, as of 2026-08-18: RV1126B NPU
+inference at 29.9 ms p50, the same truth-video assertions passing with no
+failures, and broker, hub and detector all running on the camera. Two caveats
+stay attached — its RSS grows ~13 MB/min, which is unexplained, and it carries
+no accuracy sweep.
 
 Not built: Hailo. Not measured: anything above two concurrent streams.
