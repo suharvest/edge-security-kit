@@ -22,6 +22,7 @@ the hub is about to judge.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -60,8 +61,13 @@ class FfmpegFileSource(FrameSource):
         self.decoder_report = "ffmpeg software decode of a local file (replay mode)"
         self.source_size = [self.w, self.h]
 
-    @staticmethod
-    def _probe_size(path: str) -> tuple:
+    #: ``Video: h264 (High) (avc1 / 0x31637661), yuv420p, 1280x720 [SAR 1:1 ...``
+    #: The dimensions are the first ``WxH`` token on the stream line; the SAR/DAR
+    #: ratios that follow use ``:``, so they cannot be matched by accident.
+    _DIMS_RE = re.compile(r"Video:.*?\b(\d{2,5})x(\d{2,5})\b")
+
+    @classmethod
+    def _probe_size(cls, path: str) -> tuple:
         ffprobe = shutil.which("ffprobe")
         if ffprobe:
             try:
@@ -74,6 +80,24 @@ class FfmpegFileSource(FrameSource):
                     if "x" in line:
                         w, h = line.split("x")[:2]
                         return int(w), int(h)
+            except Exception:
+                pass
+        # reCamera Pro's Buildroot image ships /usr/bin/ffmpeg WITHOUT ffprobe,
+        # so the ffprobe branch above is dead on the one platform this module was
+        # written for. ffmpeg prints the same stream line to stderr when asked to
+        # open a file with no output, and exits non-zero doing it -- hence
+        # `run(...)` and a parse of stderr rather than check_output.
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            try:
+                proc = subprocess.run(
+                    [ffmpeg, "-hide_banner", "-i", path],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15,
+                )
+                for line in proc.stderr.decode("utf-8", "replace").splitlines():
+                    m = cls._DIMS_RE.search(line)
+                    if m:
+                        return int(m.group(1)), int(m.group(2))
             except Exception:
                 pass
         raise RuntimeError(f"could not probe the frame size of {path}")
