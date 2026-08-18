@@ -259,6 +259,18 @@ def main() -> int:
     time.sleep(OBSERVE_S)
     cli.loop_stop()
     cli.disconnect()
+    t_end = time.time() * 1000.0
+
+    # Read the alert list HERE, while it still describes the window that was
+    # just tapped. Everything between the tap closing and this GET is time in
+    # which the detector keeps running and the hub keeps firing, and those
+    # extra alerts have no truth instant inside the window, so they are counted
+    # as failures. `align()` is a brute-force scan over every 5 ms offset in the
+    # clip period and takes seconds on a workstation but MINUTES on an edge CPU
+    # (reCamera Pro: ~5 min for 651 samples), which turned a clean run into
+    # three phantom count mismatches. The parse and the printing stay where
+    # they were; only the fetch moves.
+    alerts_raw = curl("GET", "/alerts?limit=500")
 
     with tap.lock:
         rows = {f"{k[0]}/{k[1]}": v for k, v in tap.rows.items()}
@@ -280,18 +292,32 @@ def main() -> int:
     (OUT / "alignment.json").write_text(json.dumps(al, indent=2))
 
     print("\n== observed ground-truth instants (from the detections the hub judged)")
-    obs = observed_events(trows)
+    # The mirror of the alert-window filter below: a truth instant that falls
+    # after the tap closed (a loitering escalation is entry + dwell_seconds, so
+    # the last entry in the window routinely escalates outside it) has its alert
+    # outside the fetched list by construction, and would be reported as a
+    # missing alert. One tolerance of margin, because an alert lands a few tens
+    # of ms after its instant.
+    obs = [e for e in observed_events(trows)
+           if e["truth_ts_ms"] <= t_end - TOL_S * 1000.0]
     for e in obs:
         print(f"  t+{(e['truth_ts_ms'] - t_begin) / 1000:7.3f}s {e['event_type']:11s} "
               f"{e.get('direction') or '':8s} track={e.get('track_id')} "
               f"frame_id={e.get('frame_id')}")
     (OUT / "observed-events.json").write_text(json.dumps(obs, indent=2))
 
-    print("\n== GET /api/alerts (raw)")
-    alerts_raw = curl("GET", "/alerts?limit=500")
+    print("\n== GET /api/alerts (raw, fetched at tap close)")
     (OUT / "alerts.json").write_text(alerts_raw)
     alerts = json.loads(alerts_raw).get("alerts", [])
-    new_alerts = [a for a in alerts if a["id"] > baseline_id]
+    # Scoped to the tap window, not merely to "newer than the baseline id". The
+    # id baseline is taken before the rules are PUT, so on a device that is
+    # already streaming the hub can fire between that GET and the tap opening;
+    # those alerts have no truth instant the harness can see, and because the
+    # line rules are matched by ZIPPING alerts against truth crossings, a single
+    # leading extra shifts every pair by one and reports the whole run as wrong
+    # directions with ~-25 s errors. Same reasoning at the closing edge.
+    new_alerts = [a for a in alerts if a["id"] > baseline_id
+                  and t_begin <= a["received_ms"] <= t_end]
     (OUT / "alerts-new.json").write_text(json.dumps({"alerts": new_alerts}, indent=2))
     print(json.dumps({"alerts": new_alerts}, indent=2))
 
