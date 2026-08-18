@@ -29,7 +29,7 @@ int8 additionally needs `--calib-dir`; the set and the reasoning are in
 The `.rknn` is not committed. `SHA256SUMS` is, so a rebuild is verifiable:
 
 ```bash
-../tools/prepare_model.sh --onnx /path/to/yolov8n.onnx --builder-host wsl2-local
+../tools/prepare_model.sh --onnx /path/to/yolov8n.onnx --builder-host <x86_64-build-host>
 sha256sum -c SHA256SUMS
 ```
 

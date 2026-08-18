@@ -96,7 +96,7 @@ FROM ubuntu:${UBUNTU_TAG}
 LABEL org.opencontainers.image.title="edge-security-detector-jetson" \
       org.opencontainers.image.description="Jetson Orin person detector for edge-security-kit: RTSP in over NVDEC, YOLOv8n on TensorRT, sensecraft.detection/1 over MQTT out, with a JPEG preview endpoint. CUDA, TensorRT and the L4T GStreamer plugins come from the board, not from this image." \
       org.opencontainers.image.version="0.1.0" \
-      org.opencontainers.image.source="https://github.com/Seeed-Studio/edge-security-kit" \
+      org.opencontainers.image.source="https://github.com/suharvest/edge-security-kit" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="Seeed Studio"
 

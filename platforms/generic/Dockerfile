@@ -40,7 +40,7 @@ FROM python:${PYTHON_TAG}
 LABEL org.opencontainers.image.title="edge-security-detector-cpu" \
       org.opencontainers.image.description="CPU/ONNX Runtime person detector for edge-security-kit: RTSP in, sensecraft.detection/1 over MQTT out, with a JPEG preview endpoint" \
       org.opencontainers.image.version="0.1.0" \
-      org.opencontainers.image.source="https://github.com/Seeed-Studio/edge-security-kit" \
+      org.opencontainers.image.source="https://github.com/suharvest/edge-security-kit" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="Seeed Studio"
 

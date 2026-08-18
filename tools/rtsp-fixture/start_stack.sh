@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bring up hub + two generic detectors on spark. Idempotent-ish: kills only the
+# Bring up hub + two generic detectors on the test host. Idempotent-ish: kills only the
 # processes this script starts (matched on their own data dir / config paths).
 set -uo pipefail
 

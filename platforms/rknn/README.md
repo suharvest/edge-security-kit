@@ -45,14 +45,14 @@ uses (md5 `eda19d19a8aa73d54411a6fc1d091c7f`), so a coordinate difference
 between the two platforms can never be blamed on different weights.
 
 ```bash
-tools/prepare_model.sh --onnx /path/to/yolov8n.onnx --builder-host wsl2-local
+tools/prepare_model.sh --onnx /path/to/yolov8n.onnx --builder-host <x86_64-build-host>
 ```
 
 Conversion is x86_64-only — there is no aarch64 RKNN Toolkit 2 wheel — so the
 script delegates to an x86_64 Fleet host and pulls the artifact back.
 
 **The toolkit version must match the runtime, and the filename lies about it.**
-On radxa `/usr/lib/librknnrt.so` is a symlink to `librknnrt.so.2.3.0`, while the
+On the board `/usr/lib/librknnrt.so` is a symlink to `librknnrt.so.2.3.0`, while the
 version compiled into that library is **2.3.2**:
 
 ```
@@ -88,7 +88,7 @@ credited the graph change to quantization, so three models were measured:
 
 ```bash
 tools/prepare_model.sh --onnx yolov8n_zoo.onnx --graph zoo --dtype int8 \
-  --calib-dir /path/on/builder/images --builder-host wsl2-local
+  --calib-dir /path/on/builder/images --builder-host <x86_64-build-host>
 ```
 
 `esk_rknn.rknn_yolo` decodes both head layouts and picks between them from the
@@ -289,13 +289,13 @@ served is genuinely decoded pixels at the source aspect ratio, just smaller
 (1280×720 arrives as 640×360). The rule canvas works in normalized coordinates
 and is unaffected.
 
-## Measured on radxa (RK3588, librknnrt 2.3.2, 1280×720 H.264 @ 5 fps)
+## Measured on a Radxa Rock 5T (RK3588, librknnrt 2.3.2, 1280×720 H.264 @ 5 fps)
 
 Model **A** only, and the original acceptance run rather than the one in the
 comparison above; a repeat measured 72.3 / 125.5 ms, so treat the difference
 between 77 and 72 as this board's run-to-run spread, not as a change.
 
-| | RK3588 (this) | spark CPU (generic) |
+| | RK3588 (this) | 20-core aarch64 workstation, CPU (generic) |
 |---|---|---|
 | `inference_time_ms` p50 / p95 | 77 / 116 ms | 30–37 ms |
 | back-to-back inference (no stream) | 46 ms p50 | — |
@@ -309,7 +309,8 @@ between 77 and 72 as this board's run-to-run spread, not as a change.
 the real result rather than a misconfiguration.** RKNPU2 is optimized for int8;
 an fp16 YOLOv8n does not play to it. What the board wins is everything else: one
 fifth of a core against two and a half cores, and decode that costs no CPU at
-all, so the RK3588 has almost the whole SoC left over while spark does not.
+all, so the RK3588 has almost the whole SoC left over while the workstation
+does not.
 
 Two measurements worth keeping:
 

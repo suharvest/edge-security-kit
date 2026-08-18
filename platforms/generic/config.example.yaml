@@ -17,7 +17,7 @@ iou_threshold: 0.45
 # which is one thread per core for EVERY session on the box: two detectors on a
 # 20-core host each took ~900% CPU, oversubscribed the machine, and inference p50
 # went 50 ms -> 138 ms at 6.2 fps. Budget cores across the detectors you actually
-# run (measured good on spark: 4-6 each, two detectors, 20 cores).
+# run (measured good on a 20-core box: 4-6 each, two detectors).
 # The failure this prevents does not look like a performance problem, see README.
 intra_threads: 4
 providers: ["CPUExecutionProvider"]

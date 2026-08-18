@@ -86,7 +86,7 @@ reports `fallback_active: true` whenever it is actually running on `sw`.
 `inference_time_ms` is the `onnxruntime` `session.run` call alone.
 `pipeline_ms` covers capture → publish for the same frame.
 
-## Measured on Spark (aarch64, ONNX Runtime 1.28 CPU, 1280×720)
+## Measured on a 20-core aarch64 workstation (aarch64, ONNX Runtime 1.28 CPU, 1280×720)
 
 | | |
 |---|---|
@@ -99,7 +99,7 @@ reports `fallback_active: true` whenever it is actually running on `sw`.
 
 `intra_threads: 0` hands ONNX Runtime its default, which is one intra-op thread
 per core — **per session**. That is fine for exactly one detector on an otherwise
-idle host and wrong everywhere else. Two detectors on the 20-core spark box with
+idle host and wrong everywhere else. Two detectors on that 20-core box with
 the cap unset:
 
 | | unset (`0`) | `intra_threads: 6` |

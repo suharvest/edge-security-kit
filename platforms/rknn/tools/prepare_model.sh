@@ -3,7 +3,7 @@
 #
 # RKNN Toolkit 2 is x86_64-only, so on any other host this delegates to an
 # x86_64 Fleet device (--builder-host). The toolkit version is pinned to the
-# version string inside the board's librknnrt (2.3.2 on radxa), not to the
+# version string inside the board's librknnrt (2.3.2 as shipped), not to the
 # filename of the .so, which lies.
 #
 # Three models are in play; see ../README.md for what each is for.

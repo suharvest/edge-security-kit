@@ -30,7 +30,7 @@ FROM python:${PYTHON_TAG}
 LABEL org.opencontainers.image.title="edge-security-hub" \
       org.opencontainers.image.description="Aggregation hub for edge-security-kit: MQTT ingest, zone/line/loitering rule engine, alert lifecycle, REST/WS API and the alert workbench" \
       org.opencontainers.image.version="0.1.0" \
-      org.opencontainers.image.source="https://github.com/Seeed-Studio/edge-security-kit" \
+      org.opencontainers.image.source="https://github.com/suharvest/edge-security-kit" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="Seeed Studio"
 

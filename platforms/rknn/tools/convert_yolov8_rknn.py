@@ -2,7 +2,7 @@
 """Convert a YOLOv8n ONNX to RKNN for RK3588 / RK3576.
 
 Runs only on x86_64: RKNN Toolkit 2 has no aarch64 wheel. The toolkit version
-must match the runtime the board actually loads -- radxa's
+must match the runtime the board actually loads -- the board's
 ``/usr/lib/librknnrt.so`` reports ``2.3.2`` even though the file is named
 ``.so.2.3.0``, so 2.3.2 is what this converts with.
 

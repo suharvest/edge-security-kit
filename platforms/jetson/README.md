@@ -321,7 +321,7 @@ canvas identical across platforms.
 
 Same truth clip, same assertions, same hub.
 
-| | **Orin NX (this)** | RK3588 int8 | RK3588 fp16 | spark CPU (generic) |
+| | **Orin NX (this)** | RK3588 int8 | RK3588 fp16 | workstation CPU (generic) |
 |---|---:|---:|---:|---:|
 | `inference_time_ms` p50 | **4.13 ms** | 41.9 ms | 72.3 ms | 30–37 ms |
 | `pipeline_ms` p50 | **7.24 ms** | 44.3 ms | 73.1 ms | 58–72 ms |

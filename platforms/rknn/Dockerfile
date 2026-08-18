@@ -74,7 +74,7 @@ FROM debian:${DEBIAN_TAG}
 LABEL org.opencontainers.image.title="edge-security-detector-rk3588" \
       org.opencontainers.image.description="RK3588 NPU person detector for edge-security-kit: RTSP in over the Rockchip MPP hardware decoder, sensecraft.detection/1 over MQTT out, with a JPEG preview endpoint. The RKNN runtime and the MPP plugin are mounted from the board, not bundled." \
       org.opencontainers.image.version="0.1.0" \
-      org.opencontainers.image.source="https://github.com/Seeed-Studio/edge-security-kit" \
+      org.opencontainers.image.source="https://github.com/suharvest/edge-security-kit" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="Seeed Studio"
 

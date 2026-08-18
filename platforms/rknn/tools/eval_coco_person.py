@@ -5,7 +5,7 @@ Three subcommands, because the three steps run on three different machines and
 nothing but small files crosses between them:
 
 ``subset``   (workstation)  choose the evaluation images and copy them out
-``infer``    (radxa)        run one .rknn over them, write COCO detections
+``infer``    (on the board)  run one .rknn over them, write COCO detections
 ``score``    (workstation)  pycocotools, overall and by GT box area
 
 Why bother instead of eyeballing a demo video: int8 does not fail loudly. It
@@ -27,7 +27,7 @@ whose margin has already gone.
 
     # workstation
     ./eval_coco_person.py subset --coco-root ~/data/coco --count 500 --out ~/data/esk-eval
-    # radxa
+    # on the board
     ./eval_coco_person.py infer --model models/yolov8n_zoo_int8.rk3588.rknn \
         --eval-dir ~/esk-eval --out ~/esk-eval/dets-C.json
     # workstation
