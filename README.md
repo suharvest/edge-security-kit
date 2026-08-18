@@ -28,16 +28,24 @@ Same 1280×720 H.264 source, same truth video, same assertions.
 | | Jetson Orin NX 16GB | Radxa Rock 5T (RK3588) | LubanCat-3 (RK3576) | reCamera Pro (RV1126B) |
 |---|---|---|---|---|
 | Accelerator | TensorRT 10.3, FP16 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 |
-| Inference p50, in pipeline | 4.16 ms | 36.2–44.5 ms | 23.9 ms | 29.9 ms |
+| Inference p50, in pipeline | 4.16 ms | 36.2–44.5 ms | 23.9 ms | 41.8 ms at 594 MHz |
 | Inference p95, in pipeline | 4.19 ms | 55.8–56.2 ms | 27.9 ms | — |
-| Full pipeline p50 | 6.99 ms | 38.1–46.3 ms | 26.2 ms | 74.7 ms |
-| Detector CPU | 5.5% of one core | 16.4–17.9% of one core | 8.6–14.0% of one core | 38–40% of one core |
+| Full pipeline p50 | 6.99 ms | 38.1–46.3 ms | 26.2 ms | 47.4 ms (camera path) |
+| Detector CPU | 5.5% of one core | 16.4–17.9% of one core | 8.6–14.0% of one core | 27% of one core |
 | Detector RSS | 310 MB | 214 MB at start | 200 MB | — |
 | Accelerator busy | GR3D 0% in 215 of 239 1 s samples | NPU Core0 8–11%, cores 1–2 idle | NPU Core0 5–6%, Core1 idle | — |
 | Board state while measured | idle, load avg 0.00 | 8 containers, 2 above 1% CPU | idle, no containers | — |
-| Decode | NVDEC, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | ffmpeg, software (no userspace MPP) |
+| Decode | NVDEC, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | none — ISP dma-buf, zero-copy |
 | Single-stream ceiling | 167 inferences/s | 31.4 inferences/s | not measured | not measured |
 | Sustained fps | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) |
+
+**The reCamera Pro column is not like-for-like.** The other three boards decode
+a replay clip; the camera takes ISP frames over dma-buf and decodes nothing at
+all, so its pipeline figure covers a different set of stages. Its inference
+number is also higher than the earlier 29.9 ms *because* the pipeline got
+cheaper: with the per-frame CPU work nearly halved the interactive governor
+settles the board at 594 MHz, and the host side of the RKNN call is CPU-bound.
+Total CPU time per frame fell from 85.8 ms to 44.9 ms.
 
 The Orin NX and RK3588 columns were re-measured on 2026-08-18 under the method
 below. The RK3576 and reCamera Pro columns are earlier runs on their own boards
@@ -181,10 +189,20 @@ broker, hub and detector all on the board. Its caveat is that no accuracy sweep
 was run there — the COCO numbers are RK3588's, and the graph and calibration set
 are identical, but that is an argument rather than a measurement. The RKNPU2
 container image now carries both SoCs' models; it has not been rebuilt since.
-reCamera Pro is verified too, as of 2026-08-18: RV1126B NPU
-inference at 29.9 ms p50, the same truth-video assertions passing with no
-failures, and broker, hub and detector all running on the camera. Two caveats
-stay attached — its RSS grows ~13 MB/min, which is unexplained, and it carries
-no accuracy sweep.
+reCamera Pro is verified too, as of 2026-08-19: the truth-video assertions pass
+with no failures, and broker, hub and detector all run on the camera. It takes
+ISP frames over dma-buf and letterboxes on RGA, so on the camera path it decodes
+nothing — that halved per-frame CPU time, from 85.8 ms to 44.9 ms.
+
+Two caveats stay attached. It carries no accuracy sweep. And its RSS grows
+~13 MB/min on both frame paths, which is localized but not fixed: the growth is
+entirely anonymous `[heap]`, Python object counts and mapping counts stay flat,
+and glibc's free pool shrinks — so it is malloc'd memory a C extension holds,
+with the RKNN runtime the only native component common to both paths. Against
+that, `fall-detection` uses the same wrapper and held 263 MB over 12 hours, so
+if it is the runtime it depends on output shape. The deciding experiment is a
+bare inference loop, which needs root for `/dev/rknpu`. On a 2 GB board this is
+hours to trouble, so treat long-running camera deployments as unproven until it
+is settled.
 
 Not built: Hailo. Not measured: anything above two concurrent streams.
