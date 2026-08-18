@@ -181,10 +181,18 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #2f6fed55; border
   width: 112px; height: 68px; object-fit: cover; border-radius: 4px;
   background: #000; border: 1px solid var(--line); cursor: pointer; flex: none;
 }
+/* The placeholder must not read as a broken image. On the black .snap
+   background a 10px dim label was invisible at thumbnail size, so a row of
+   alerts still waiting for their snapshot looked like a row of dead tiles -
+   and those are the newest alerts, the ones an operator actually needs. */
 .snap-empty {
   display: flex; align-items: center; justify-content: center; text-align: center;
-  font-size: 10px; color: var(--dim); cursor: default; padding: 2px;
+  font-size: 11px; line-height: 1.25; color: var(--fg2); cursor: default; padding: 4px;
+  background: var(--bg2); border-style: dashed;
 }
+.snap-empty.snap-pending { animation: snap-wait 1.6s ease-in-out infinite; }
+@keyframes snap-wait { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+@media (prefers-reduced-motion: reduce) { .snap-empty.snap-pending { animation: none; } }
 .snap-big { width: 100%; height: auto; max-height: 52vh; object-fit: contain; cursor: default; }
 .snap-empty.snap-big { height: 180px; }
 .card-mid { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }

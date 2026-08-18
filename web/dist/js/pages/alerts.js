@@ -201,7 +201,9 @@ function Snapshot({ a, onOpen, thumb }) {
   if (noImage) {
     const label = a.snapshot_state === 'pending' ? t('alerts.snapshotPending')
       : a.snapshot_state === 'timeout' ? t('alerts.snapshotTimeout') : t('alerts.snapshotNone');
-    return html`<div class=${'snap snap-empty' + (thumb ? '' : ' snap-big')}><span>${label}</span></div>`;
+    const pending = !failed && a.snapshot_state === 'pending';
+    return html`<div class=${'snap snap-empty' + (pending ? ' snap-pending' : '') + (thumb ? '' : ' snap-big')}
+                     title=${label}><span>${label}</span></div>`;
   }
   return html`
     <img class=${'snap' + (thumb ? '' : ' snap-big')} src=${url} alt="snapshot" loading="lazy"
