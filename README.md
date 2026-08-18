@@ -29,11 +29,12 @@ Same 1280×720 H.264 source, same truth video, same assertions.
 |---|---|---|---|---|
 | Accelerator | TensorRT 10.3, FP16 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 |
 | Inference p50, in pipeline | 4.16 ms | 36.2–44.5 ms | 23.9 ms | 29.9 ms |
-| Inference p95, in pipeline | 4.19 ms | 55.8–56.2 ms | — | — |
+| Inference p95, in pipeline | 4.19 ms | 55.8–56.2 ms | 27.9 ms | — |
 | Full pipeline p50 | 6.99 ms | 38.1–46.3 ms | 26.2 ms | 74.7 ms |
 | Detector CPU | 5.5% of one core | 16.4–17.9% of one core | 8.6–14.0% of one core | 38–40% of one core |
-| Detector RSS | 310 MB | 214 MB at start | — | — |
-| Accelerator busy | GR3D 0% in 215 of 239 1 s samples | NPU Core0 8–11%, cores 1–2 idle | — | — |
+| Detector RSS | 310 MB | 214 MB at start | 200 MB | — |
+| Accelerator busy | GR3D 0% in 215 of 239 1 s samples | NPU Core0 8–11%, cores 1–2 idle | NPU Core0 5–6%, Core1 idle | — |
+| Board state while measured | idle, load avg 0.00 | 8 containers, 2 above 1% CPU | idle, no containers | — |
 | Decode | NVDEC, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | ffmpeg, software (no userspace MPP) |
 | Single-stream ceiling | 167 inferences/s | 31.4 inferences/s | not measured | not measured |
 | Sustained fps | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) |
@@ -92,11 +93,23 @@ the *full* loop on both boards — one process, flat out, preprocess + infer +
 head decode — so 167 and 31.4 inferences/s are measured by the same recipe.
 
 RK3576 and RK3588 run one implementation — `platforms/rknn/` has no chip branch,
-only a different `.rknn` — and RK3576 turns in roughly half RK3588's per-frame
-latency on the same model built from the same ONNX and calibration set. The two
-boards were measured on different days with no attempt to hold thermals or
-kernel version equal, so that is a result about these two systems, not a
-per-TOPS ranking of the two NPUs. Board detail:
+only a different `.rknn` — and RK3576 turns in roughly half to two-thirds of
+RK3588's per-frame latency on the same model built from the same ONNX and
+calibration set.
+
+The load explanation for that gap was tested and does not hold. RK3588 was
+measured with eight containers on the board and RK3576 with none, so the
+suspicion was contention; stopping the RK3588 co-tenants that measurably used
+CPU moved its inference p50 the wrong way, from 36.2 ms to 39.6 and 44.5 ms,
+and never toward RK3576's 23.9 ms. NPU occupancy says the same thing from the
+other side: Core0 reads 8–11 % on RK3588 against 5–6 % on RK3576, and a
+container competing for CPU cannot inflate NPU busy time.
+
+What remains uncontrolled is the boards themselves: different kernels,
+different days, no attempt to hold thermals or DVFS equal, and RK3576's figure
+is one 70 s window with no repeat while RK3588's p50 is known to move 8 ms
+between windows. So it is a result about these two systems, not a per-TOPS
+ranking of the two NPUs. Board detail:
 `lubancat-rk3576-debian12-gnome-20250721`, kernel `6.1.99-rk3576`, RKNPU driver
 0.9.8.
 

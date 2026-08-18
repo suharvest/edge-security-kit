@@ -496,19 +496,37 @@ measurement, and small-target AP on RK3576 is **unverified**.
 | | Orin NX 16GB | Rock 5T (RK3588) | **LubanCat-3 (RK3576)** | reCamera Pro (RV1126B) |
 |---|---:|---:|---:|---:|
 | precision | TensorRT FP16 | RKNN int8 | **RKNN int8** | RKNN int8 |
-| inference p50, in pipeline | 4.13 ms | 41.9 ms | **23.9 ms** | 29.9 ms |
-| full pipeline p50 | 7.24 ms | 44.3 ms | **26.2 ms** | 74.7 ms |
-| detector CPU | 8.5 – 12.5 % | 21 % | **8.6 – 14.0 %** | 38 – 40 % |
+| inference p50, in pipeline | 4.16 ms | 36.2 – 44.5 ms | **23.9 ms** | 29.9 ms |
+| inference p95, in pipeline | 4.19 ms | 55.8 – 56.2 ms | **27.9 ms** | — |
+| full pipeline p50 | 6.99 ms | 38.1 – 46.3 ms | **26.2 ms** | 74.7 ms |
+| detector CPU | 5.5 % | 16.4 – 17.9 % | **8.6 – 14.0 %** | 38 – 40 % |
+| NPU / GPU busy | GR3D 0 % in 215/239 | Core0 8 – 11 % @ 1.0 GHz | **Core0 5 – 6 % @ 950 MHz** | — |
+| board state while measured | idle, load avg 0.00 | 8 containers, 2 above 1 % CPU | **idle, no containers** | — |
 | decode | NVDEC | MPP | **MPP** | ffmpeg (software) |
 
-**RK3576 runs this model at roughly half of RK3588's per-frame latency.** Both
-boards load `librknnrt 2.3.2`, both were given a model converted from the same
-ONNX with the same toolkit and the same 400-image calibration list, and the only
-argument that differed was `--platform`, so the model is ruled out. What is not
-ruled out is the boards: the two numbers come from different systems measured on
-different days, and no attempt was made to hold DVFS, thermals or kernel version
-equal. Read it as "RK3576 is not the slower part it is priced as", not as a
-per-TOPS ranking of the two NPUs.
+Only the Orin NX and RK3588 columns come from the controlled 2026-08-18 pairing.
+RK3576 and reCamera Pro were measured on their own boards on their own days.
+
+**RK3576 runs this model at roughly half to two-thirds of RK3588's per-frame
+latency, and that gap is not the co-tenants on the RK3588 board.** The obvious
+suspicion was that RK3588's number was inflated by load: it was measured with
+eight containers running, RK3576 with none. That was tested directly. Stopping
+the two RK3588 co-tenants that measurably used CPU moved inference p50 from
+36.2 ms to 39.6 and 44.5 ms — the wrong way — and the whole four-window range
+straddles the 41.9 ms originally published. **Quiescing does not move RK3588
+toward RK3576.**
+
+The NPU occupancy is the second reason to stop blaming load. Core0 reads 8–11 %
+on RK3588 against 5–6 % on RK3576, and NPU busy time is not something a
+container competing for CPU can inflate. The occupancy ratio tracks the latency
+ratio, which puts the difference on the NPU path rather than on host contention.
+
+What is still not controlled: the two boards ran different kernels on different
+days with no attempt to hold DVFS or thermals equal, and RK3576's run is a
+single 70 s window with no repeat, so it has no spread attached to it while
+RK3588's p50 is known to move 8 ms between windows. Read the comparison as
+"RK3576 is not the slower part it is priced as", not as a per-TOPS ranking of
+the two NPUs, and not as a number to quote to one decimal place.
 
 ### End to end, against the truth video
 
