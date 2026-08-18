@@ -1,9 +1,24 @@
-# RK3588 detector (RKNN NPU + Rockchip MPP)
+# RKNPU2 detector (RK3588 / RK3576, RKNN NPU + Rockchip MPP)
 
 RTSP → person detection → `sensecraft.detection/1` over MQTT, with inference on
-the RK3588 NPU and decode on the Rockchip MPP hardware decoder. It publishes the
-same payloads as [`platforms/generic`](../generic), so the hub cannot tell the
-platforms apart except through `health`.
+the Rockchip NPU and decode on the Rockchip MPP hardware decoder. It publishes
+the same payloads as [`platforms/generic`](../generic), so the hub cannot tell
+the platforms apart except through `health`.
+
+**Two SoCs, one implementation.** RK3588 and RK3576 are both RKNPU2 behind the
+same `librknnrt`, and both negotiate the same MPP/RGA output geometry, so there
+is no chip branch anywhere in this package — not in the decoder, the letterbox,
+the tracker or the publisher. The only per-chip input is which `.rknn` the
+config points at, and a model built for the wrong SoC is refused at
+`init_runtime` rather than run:
+
+```
+E RKNN: This rknn model is for RK3588, but current platform is RK3576
+```
+
+Both are verified on hardware; the measurements are in
+[Measured on a Radxa Rock 5T](#measured-on-a-radxa-rock-5t-rk3588-librknnrt-232-1280720-h264--5-fps)
+and [Measured on a LubanCat-3](#measured-on-a-lubancat-3-rk3576-librknnrt-232-1280720-h264--5-fps).
 
 Like the generic platform it is a hub-mode detector: it publishes detections and
 status, never events. The hub judges rules, which requires tracked targets
@@ -28,7 +43,9 @@ uv venv --system-site-packages --python /usr/bin/python3 .venv
 uv pip install --python .venv/bin/python \
   "opencv-python-headless>=4.9" "paho-mqtt>=1.6,<2.0" "pyyaml>=6.0"
 
-cp config.example.yaml config/config.yaml     # edit device_id / source / mqtt_host
+cp config.example.yaml config/config.yaml           # RK3588
+cp config.rk3576.example.yaml config/config.yaml   # RK3576
+# then edit device_id / source / mqtt_host
 ./.venv/bin/python -m esk_rknn --config config/config.yaml
 ```
 
@@ -46,7 +63,13 @@ between the two platforms can never be blamed on different weights.
 
 ```bash
 tools/prepare_model.sh --onnx /path/to/yolov8n.onnx --builder-host <x86_64-build-host>
+tools/prepare_model.sh --onnx /path/to/yolov8n.onnx --platform rk3576 \
+  --builder-host <x86_64-build-host>
 ```
+
+`--platform` is the only thing that differs between the two SoCs' builds — same
+ONNX, same calibration list, same toolkit version — so a difference measured
+between the boards cannot be attributed to a different model.
 
 Conversion is x86_64-only — there is no aarch64 RKNN Toolkit 2 wheel — so the
 script delegates to an x86_64 Fleet host and pulls the artifact back.
@@ -67,6 +90,14 @@ The board confirms the pairing at load time:
 ```
 RKNN Runtime Information, librknnrt version: 2.3.2
 RKNN Model Information, version: 6, toolkit version: 2.3.2, target platform: rk3588
+```
+
+The RK3576 board carries the same runtime, so it converts with the same 2.3.2:
+
+```
+RKNN Runtime Information, librknnrt version: 2.3.2 (429f97ae6b@2025-04-09T09:09:27)
+RKNN Driver Information, version: 0.9.8
+RKNN Model Information, version: 6, toolkit version: 2.3.2, target: RKNPU f2, target platform: rk3576
 ```
 
 `W Query dynamic range failed ... RKNN_ERR_MODEL_INVALID` on every start is
@@ -202,8 +233,9 @@ Two caveats stay attached:
   `calibration/` is kept because it is the right shape for the deployment, not
   because it was measured to help. See `calibration/README.md`.
 
-`config.example.yaml` still points at A. Switching the default is a deliberate
-act, not a side effect of this measurement.
+`config.example.yaml` ships C. `config.rk3576.example.yaml` ships the RK3576
+build of C for the same reasons, re-measured on that board rather than assumed —
+see below.
 
 ## Coordinates
 
@@ -219,8 +251,18 @@ OpenCV does it. If the two disagree by one pixel of pad, the same scene produces
 different published coordinates depending on which decoder started. Both
 therefore call `letterbox.fit_geometry`, and the inverse is built from the
 integer geometry actually applied. `tests/test_letterbox.py` pins that they
-agree, and `fixture/evidence-annotated.jpg` shows boxes redrawn from published
-values on a real 1280×720 frame.
+agree, and `fixtures/rk3588-evidence-annotated.jpg` shows boxes redrawn from
+published values on a real 1280×720 frame.
+
+**Re-verified per SoC, not inherited.** RGA is a different block on RK3576 and
+nothing guarantees it rounds a scale the same way, so the inverse was measured
+again there rather than assumed from the RK3588 pass. It negotiates the
+identical 640×360 output, and `fixtures/rk3576-evidence-annotated.jpg` (subject
+right of the line) and `-left.jpg` (subject left of it) show the boxes on that
+board. The number behind the pictures is in the RK3576 section below: against
+`truth.json`, which describes the subject in *original-frame* normalized units,
+the published box height is off by a mean of 0.0035 — 2.5 px of 720. An
+unreversed pad would put it 261 px out.
 
 The scale is kept per-axis rather than as one shared ratio: after integer
 rounding a 1281-wide source does not scale identically in both axes, and one
@@ -326,14 +368,173 @@ Two measurements worth keeping:
   several models concurrently, not for splitting one small one — `npu_core_mask`
   is left `null`.
 
+## Measured on a LubanCat-3 (RK3576, librknnrt 2.3.2, 1280×720 H.264 @ 5 fps)
+
+EmbedFire LubanCat-3, `lubancat-rk3576-debian12-gnome-20250721`, kernel
+`6.1.99-rk3576`, `librockchip-mpp1 1.5.0-1`, `librga2 2.2.0-1`, RKNPU driver
+`0.9.8`, NPU pinned at 950 MHz by the `performance` governor. Broker, hub and
+detector all on the board; RTSP served from the board too, so network jitter
+cannot be read as detector latency.
+
+### The NPU is reachable, and not through a `/dev/rknpu` node
+
+Worth stating because the obvious check fails: **there is no NPU device node
+under `/dev/` on this image.** `ls /dev | grep -i npu` returns nothing, and it
+would be easy to conclude the driver is absent. It is not — RKNPU registers as a
+DRM device, and the runtime reaches it through `/dev/dri/card1`:
+
+```
+$ cat /sys/class/drm/card1/device/uevent | grep DRIVER
+DRIVER=RKNPU
+$ readlink -f /sys/class/drm/renderD129/device
+/sys/devices/platform/27700000.npu
+```
+
+`init_runtime` is the test that settles it, and it also settles the model
+question in one step, because a model for the other SoC is rejected there:
+
+```
+RKNN Runtime Information, librknnrt version: 2.3.2 (429f97ae6b@2025-04-09T09:09:27)
+RKNN Driver Information, version: 0.9.8
+RKNN Model Information, ... target: RKNPU f2, target platform: rk3576
+INIT_RUNTIME_RC = 0
+```
+
+### int8 against fp16, in the live pipeline
+
+70 s per model on the running stream, same board, same source:
+
+| | zoo fp16 | zoo int8 |
+|---|---:|---:|
+| `inference_time_ms` p50 / p95 | 48.60 / 55.27 | **23.88 / 27.87** |
+| detector CPU (one core) | 16.3 – 19.3 % | 8.6 – 14.0 % |
+| RSS | 155 MB | 200 MB |
+| NPU Core0 @ 950 MHz | 9 – 10 % | 5 – 6 % |
+| NPU Core1 | 0 % | 0 % |
+| sustained fps | 5.00 (source-limited) | 5.00 (source-limited) |
+
+int8 halves inference latency here, as it does on RK3588, so **C is what
+`config.rk3576.example.yaml` ships**. Two things in that table are not what the
+RK3588 measurement would predict and are reported as measured rather than
+explained: int8's RSS is *higher* than fp16's on this board, and its CPU is
+lower — the opposite of RK3588, where the zoo/NumPy DFL pushed CPU up. Neither
+was chased down; at 5 fps neither changes a decision.
+
+No accuracy sweep was run on this board. The COCO and surveillance numbers above
+are RK3588's, and they are properties of the quantized graph and its calibration
+set, both of which are byte-identical here — but that is an argument, not a
+measurement, and small-target AP on RK3576 is **unverified**.
+
+### Against the four platforms
+
+| | Orin NX 16GB | Rock 5T (RK3588) | **LubanCat-3 (RK3576)** | reCamera Pro (RV1126B) |
+|---|---:|---:|---:|---:|
+| precision | TensorRT FP16 | RKNN int8 | **RKNN int8** | RKNN int8 |
+| inference p50, in pipeline | 4.13 ms | 41.9 ms | **23.9 ms** | 29.9 ms |
+| full pipeline p50 | 7.24 ms | 44.3 ms | **26.2 ms** | 74.7 ms |
+| detector CPU | 8.5 – 12.5 % | 21 % | **8.6 – 14.0 %** | 38 – 40 % |
+| decode | NVDEC | MPP | **MPP** | ffmpeg (software) |
+
+**RK3576 runs this model at roughly half of RK3588's per-frame latency.** Both
+boards load `librknnrt 2.3.2`, both were given a model converted from the same
+ONNX with the same toolkit and the same 400-image calibration list, and the only
+argument that differed was `--platform`, so the model is ruled out. What is not
+ruled out is the boards: the two numbers come from different systems measured on
+different days, and no attempt was made to hold DVFS, thermals or kernel version
+equal. Read it as "RK3576 is not the slower part it is priced as", not as a
+per-TOPS ranking of the two NPUs.
+
+### End to end, against the truth video
+
+`tools/rtsp-fixture/verify_e2e.py`, 130 s, int8, hub and broker on the board:
+
+```
+== FAILURES
+  none
+```
+
+| assertion | tolerance | measured |
+|---|---|---|
+| `line_cross` forward instants (×4) | ±0.5 s | 0.177 – 0.189 s |
+| `line_cross` backward instants (×4) | ±0.5 s | 0.011 – 0.013 s |
+| direction correctness | 8/8 | 8/8 |
+| forward-only line fired on a backward crossing | never | **NONE** |
+| backward-only line fired on a forward crossing | never | **NONE** |
+| `zone_enter` instants (×4) | ±0.5 s | 0.002 – 0.004 s |
+| `loitering` dwell error | ≤1 s | 0.006 – 0.204 s |
+| snapshots | real JPEG | 8/8, `image/jpeg`, 17.5 – 17.7 KB |
+| trajectory alignment vs `truth.json` | — | mean \|cx\| err 0.00204, p95 0.00322, max 0.00463 |
+| stream continuity | — | 651 msgs / 130.0 s = 5.01/s, gap p50 202 ms max 217 ms, one track id |
+
+Capture-to-alert p50 **39.4 ms**, p95 **224.3 ms**.
+
+The truth line is nudged to x=0.503 (`ESK_LINE_X`), the same offset RK3588 and
+Jetson used. RK3576 needs it for the same reason RK3588 does and not by
+inheritance: MPP/RGA emits 640 px wide here too, so a published `cx` can only
+land on a multiple of 1/640 and 0.5 is exactly on that grid.
+
+The first run of these assertions reported five `zone_enter` failures, each off
+by 31.0 s — one truth-video loop period exactly. That is the artefact already
+documented for RK3588 and Jetson: the run began mid-loop with the subject
+already inside the zone, the hub emitted a leading `zone_enter` the moment its
+rules were installed, and the in-order matcher then paired every later alert
+with the previous loop's instant. The table above is the immediately following
+run on the established loop, unchanged in every other respect.
+
+### Letterbox, checked on the vertical axis
+
+The x axis is covered by the trajectory alignment above, which is against
+original-frame normalized coordinates. `truth.json` also fixes the subject's
+vertical geometry — `cy_const` 0.54028, patch height 662/720 = 0.91944 — so the
+published boxes can be scored against it directly. Over 301 consecutive
+detections:
+
+| | truth | mean published | mean abs err | max abs err |
+|---|---:|---:|---:|---:|
+| `bbox` cy | 0.54028 | 0.53675 | 0.00353 (2.5 px) | 0.00959 (6.9 px) |
+| `bbox` h | 0.91944 | 0.91649 | 0.00354 (2.5 px) | 0.01534 (11 px) |
+
+A letterbox pad that was never reversed would put `h` at ~0.36 rather than 0.92.
+`bbox` w is legitimately narrower than the patch (0.214 against 0.232): the
+patch is a rectangular crop containing a person, and the detector boxes the
+person.
+
+### Hardware decode, from the kernel side
+
+`GET :8099/debug/decode` reports `mppvideodec` and RGB 640×360, and the kernel
+agrees — with the detector running, that process is the only holder of
+`/dev/mpp_service` on the board:
+
+```
+$ lsof /dev/mpp_service
+COMMAND     PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+python  2034513  cat   25u   CHR  241,0      0t0   91 /dev/mpp_service
+
+$ ls -l /proc/2034513/fd | grep -oE '/dev/[a-z0-9/_]+' | sort | uniq -c
+      4 /dev/dma_heap/system
+      1 /dev/dri/card1        <- RKNPU (there is no /dev/rknpu on this image)
+      1 /dev/mpp_service      <- Rockchip hardware video decoder
+      1 /dev/rga              <- 2D hardware scaler
+
+$ ps -L -p 2034513 -o comm= | grep -i mpp
+mpp_dec_hal
+mpp_dec_parser
+```
+
+One difference from the RK3588 board, which changes nothing but is real: the DMA
+buffers come from `/dev/dma_heap/system` rather than `/dev/dma_heap/cma`.
+`health.decode` reports `hw` with `fallback_active: false` throughout, and the
+captured `fixtures/rk3576-detection.json` carries that.
+
 ## Tests
 
 ```bash
 uv run pytest     # letterbox/geometry, tracker IDs, head decode, fixture conformance
 ```
 
-All host-only: no NPU, no board, no network. `fixtures/*.json` were captured
-verbatim off the broker during a real RK3588 run and are validated against
+All host-only: no NPU, no board, no network. `fixtures/rk3588-*.json` and
+`fixtures/rk3576-*.json` were captured verbatim off the broker during a real run
+on each board — one set per SoC, neither copied from the other — and validated against
 `contracts/mqtt-detection.schema.json` as the contract's Conformance section
 requires. `tests/test_fixtures_schema.py` additionally asserts the captured
 fixtures report `decode: hw` — a fixture that says `sw` means the run being
