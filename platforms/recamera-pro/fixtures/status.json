@@ -1,0 +1,28 @@
+{
+  "schema": "sensecraft.status/1",
+  "timestamp": 1787062846901,
+  "session_id": "1787061900055",
+  "device_id": "recamera-pro-01",
+  "online": true,
+  "streams": [
+    {
+      "stream_id": "cam-0",
+      "state": "running",
+      "fps": 5.0,
+      "decode": "sw",
+      "preview_url": "http://127.0.0.1:8099/preview/cam-0.jpg",
+      "live_url": "http://127.0.0.1:8099/live/cam-0"
+    }
+  ],
+  "health": {
+    "fps": 5.0,
+    "decode": "sw",
+    "backend": "rknn-lite2-2.3.2",
+    "fallback_active": false
+  },
+  "versions": {
+    "app": "0.1.0",
+    "model": "yolov8n_zoo_int8.rv1126b@bb14763094ff"
+  },
+  "uptime_s": 946.8
+}
