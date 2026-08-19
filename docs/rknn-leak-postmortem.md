@@ -118,6 +118,37 @@ rknnlite——`/proc/PID/maps` 对非特权账号不可读时，这是唯一的�
    与每次迭代都检查的 `min_free_mb`（4.9 MB/次时，32 次一检查就是 157 MB 盲区）。
 4. **换实现前做数值等价测试**：逐元素对比 + 解码后 bbox 对比。签名不变的替换出错时不抛异常。
 
+## 独立复现
+
+`tools/rknn-leak-repro/` 是不依赖本仓库的两个脚本，拷到任意 RKNPU 板子上直接跑：
+
+| 脚本 | 路径 | 依赖 |
+|---|---|---|
+| `leak_repro.py` | `rknnlite.api.RKNNLite`，`load_rknn` + `init_runtime` 各一次，稳定 `inference()` 循环 | `numpy` + `rknn_toolkit_lite2` |
+| `ctypes_control.py` | ctypes 直调 `librknnrt.so`，与 Cython 扩展逐字节相同的 API 序列 | `numpy` + `ctypes` |
+
+```bash
+python3 leak_repro.py     --model yolov8n.rknn --seconds 300 --sample-every 30
+python3 ctypes_control.py --model yolov8n.rknn --seconds 300 --sample-every 30
+python3 ctypes_control.py --model yolov8n.rknn --omit-release   # 阳性对照，内建限量
+```
+
+两个脚本用同一套 warmup、采样间隔与 kB/次算法，数字可直接对比；输入尺寸与输出张量数
+从模型查询得到，不硬编码。`--omit-release` 每次保留约 4.6 MB，默认 40 次迭代封顶，
+并在每次迭代后检查 `MemAvailable`。
+
+RK3588（librknnrt 2.3.2、驱动 0.9.8、rknn_toolkit_lite2 2.3.2，与 RV1126B 同版本）
+实跑结果：
+
+| 模式 | 迭代 | kB/次 |
+|---|---:|---:|
+| `leak_repro.py` | 13 359 | 42.4876 |
+| `ctypes_control.py` | 14 551 | 0.0542 |
+| `ctypes_control.py --omit-release` | 40（限量停住） | 4639.7 |
+
+完整原始输出、`/dev/rknpu` 权限问题与取得 root 的两种方式见
+`tools/rknn-leak-repro/README.md`。
+
 ## 上游状态
 
 `rknn_toolkit_lite2` 2.3.2 是最新版，也是 RV1126B 上唯一支持的版本；仓库 16 个月无新版本，
@@ -127,4 +158,5 @@ changelog 无相关修复条目；板上 `librknnrt` 与驱动由固件提供，
 [airockchip#42](https://github.com/airockchip/rknn-toolkit2/issues/42) 症状同类，但无版本、
 无平台、无量化数据、无分层定位，开启 22 个月无官方回复。Rockchip Redmine 需账号，未覆盖。
 
-issue 草稿（含最小复现、ctypes 对照、阳性对照）已备好，提交前需在板上实跑一遍复现脚本。
+issue 草稿（含最小复现、ctypes 对照、阳性对照）引用 `tools/rknn-leak-repro/` 下的脚本，
+三种模式已在 RK3588 上实跑，输出见该目录的 README。RV1126B 上的复现待设备可用时补测。
