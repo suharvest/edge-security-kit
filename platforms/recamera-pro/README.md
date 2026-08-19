@@ -97,16 +97,56 @@ Stage p50, from `GET /debug/decode` → `app.stage_ms_p50` (camera path, 6 fps):
 | **CPU** | 51.5 % of one core | **27.0 %** |
 | **CPU-time per frame** | 85.8 ms | **44.9 ms** |
 
-`inference_time_ms` *rose*, 30.6 → 41.8 ms p50, and that is not noise: the
-governor is `interactive` over 594 MHz–1.608 GHz, and with the per-frame CPU
-work nearly halved the board settles at `scaling_cur_freq = 594000`. The
-host-side part of the RKNN call (input marshalling, output dequant) is CPU-bound
-and runs proportionally slower there. Per-frame *work* fell by 48 %; per-call
-*latency* on a downclocked core rose. Both numbers are above; neither alone
-describes the change.
+`inference_time_ms` *rose*, 30.6 → 41.8 ms p50. That was recorded with the
+governor on `interactive` over 594 MHz–1.608 GHz and the board sitting at
+`scaling_cur_freq = 594000`, so "the downclock did it" was the obvious reading —
+and an untested one, because waiting for `interactive` to pick 594 MHz again is
+not an experiment: the load that makes it pick 594 MHz is exactly what the
+comparison changes.
 
-fps is unchanged at 6.0 because the frame broker, not the pipeline, sets it —
-`pipeline_ms` 47 ms would support ~21 fps.
+### Pinning the clock, three ways
+
+`esk/cpufreq.py` pins the policy for the duration of a run and puts it back on
+every exit path. `cpu_governor` accepts a governor, optionally with a step —
+`performance@594000` holds the bottom step deliberately, which is what makes the
+slow case reproducible rather than incidental. All three rows below are the
+camera path on the same board, same package, ~5 minutes each, and the frequency
+column is the sampled histogram, not one reading:
+
+| clock | `scaling_cur_freq` samples | `inference_time_ms` p50 / p95 | `pipeline_ms` p50 / p95 | fps |
+|---|---|---:|---:|---:|
+| `performance@594000` | 594 MHz, **304/304 samples** | **47.77 / 52.47** | 51.86 / 57.79 | 14.1 |
+| `interactive` (as shipped) | 594 MHz–1.608 GHz, mean 1017 MHz | **36.59 / 46.81** | 39.74 / 50.81 | 18.8 |
+| `performance` (1.608 GHz) | 1.608 GHz, **362/362 samples** | **32.25 / 36.28** | 35.14 / 39.47 | 20.0 |
+
+**Of the inference call, 15.5 ms of 47.8 ms — 32 % — is the downclock.**
+Applying the same 594 MHz→1.608 GHz ratio (1.481) to the 41.8 ms figure puts it
+at ~28.2 ms on a pinned clock, i.e. *below* the 30.6 ms it was compared against.
+At equal clock the zero-copy change did not make inference slower; it made it
+slightly faster. The earlier table compared two different operating points and
+read the difference as a regression.
+
+The three rows also decompose the call, because latency scales with 1/f only for
+the part that runs on the CPU. Solving `T = npu + c/f` across the two pinned
+rows gives **23.2 ms clock-invariant** (NPU execution plus fixed overhead) and a
+CPU-bound host share of **9.1 ms at 1.608 GHz, 24.6 ms at 594 MHz**. The
+`interactive` row is a check on that fit rather than an input to it: predicted
+37.5 ms at its mean frequency against 36.6 ms measured.
+
+**The governor is restored after every run and is not a product setting.** This
+policy covers all four cores, so `performance` holds the whole SoC at 1.608 GHz
+whether or not anything is running — a permanent power cost on a camera that
+idles most of the day, in exchange for 4.4 ms of p50 that nothing downstream is
+waiting on. `GovernorLock.restore()` writes `max` back before `min` (the kernel
+rejects the other order) and reports `matches_original` rather than assuming.
+
+### fps is set by the frame broker, and it moved
+
+The earlier table's 6.0 fps is not a property of this platform: the same code on
+the same board now reads **18.8–20.0 fps** on the camera path, and the pinned-clock
+rows show fps tracking the clock (14.1 / 18.8 / 20.0). Any figure quoted per
+frame — CPU %, MB/min — has to name the frame rate it was measured at, which is
+why the RSS section below is stated per *inference* instead.
 
 ## Measured on a reCamera Pro (RV1126B, librknnrt 2.3.2, 1280×720 H.264 @ 5 fps replay)
 
@@ -192,18 +232,80 @@ Read together these exclude three of the four candidates and name the fourth:
   43 kB per inference — the same order, scaling with inference count rather
   than with frame size or fps alone.
 
-Not yet proven, and what would prove it: a standalone loop calling
-`rknn_lite.inference()` on a constant array with no frame source, no MQTT and no
-preview server. That needs `/dev/rknpu`, which is root-only, so it has to be
-packaged as an appmgr app to run at all — the reason it is not in this round.
-Note that the shipped `fall-detection` app uses the same `kit.runtime.engine`
-wrapper and had been running 12 h at 263 MB when this work started, so if the
-RKNN runtime is the source it is model- or output-shape-dependent (this app's
-`rknn_model_zoo` head returns nine output tensors per frame) rather than
-universal.
+### The bare loop settles it
 
-**Do not run this unattended until that is settled.** A supervisor restart on an
-RSS ceiling is the available mitigation today.
+That last bullet was elimination, not proof. `bench_infer=1` replaces the whole
+pipeline with `esk/bench_infer.py`: `model.infer()` on **one** pre-allocated
+constant array, no frame source, no RGA, no letterbox, no tracker, no MQTT, no
+JPEG — outputs dropped with `del` on every iteration. It runs inside the appmgr
+app because `/dev/rknpu` is root-only.
+
+| run | model | iterations | RSS start → end | slope | **per iteration** | `mapping_count` |
+|---|---|---:|---:|---:|---:|---:|
+| `bench_mode=infer` | `yolov8n_zoo_int8` (9 outputs) | 15 842 / 600 s | 210 → 754 MB | 67.7 MB/min | **43.8 kB** | 298 → 298 |
+| `bench_mode=infer` | `yolo11n_pose_rawhead_int8` (9 outputs) | 14 698 / 600 s | 152 → 566 MB | 48.9 MB/min | **34.0 kB** | 302 → 302 |
+| `bench_mode=idle` (control) | — (loop only, no inference) | **273 149** / 300 s | 61 152 → 61 152 kB | **0.0** | **0.0** | 288 → 288 |
+
+The idle control is the part that makes the other two mean something: a quarter
+of a million iterations of the identical loop, the identical sampler and the
+identical HTTP server move RSS by **zero kilobytes** and `[heap]` by zero bytes.
+The harness does not leak. Adding one `infer()` call per iteration does.
+
+Three things this pins down that the elimination table could not:
+
+* **it is the inference call, not the frame path.** Nothing that touches a
+  camera, a decoder, RGA or a socket is in the bench process at all;
+* **it is not output-shape specific.** A second graph — the shipped
+  `fall-detection` pose model, a different export with different channel counts —
+  leaks on the same wrapper. The magnitude tracks the model (43.8 vs 34.0 kB),
+  the existence does not. That kills the "then why is `fall-detection` flat"
+  objection as evidence: it is flat because with no WebSocket consumer attached
+  it is not inferring, not because its graph is immune;
+* **it is clock- and rate-independent.** The live pipeline leaks 39.8–41.2 kB
+  per inference across 594 MHz / `interactive` / 1.608 GHz and 14–20 fps; the
+  bench leaks 43.8 kB at ~26 inferences/s. Per *frame*, per *minute* and per
+  *fps* all move; per *inference* does not.
+
+### Which native component, and which one it is not
+
+`kit.runtime.engine.RknnModel.infer` calls `rknnlite.api.RKNNLite.inference`,
+which is `rknn_runtime.cpython-311-aarch64-linux-gnu.so` (rknn_toolkit_lite2
+2.3.2) over `librknnrt.so` — that extension's dynamic references are
+`rknn_inputs_set`, `rknn_run`, `rknn_outputs_get`, `rknn_outputs_release`,
+`rknn_query`, `rknn_init`, `rknn_destroy`. **That is the leaking path.**
+
+`librecamera_ext.so.1.0.0` is *excluded*, and by symbols rather than by
+argument. The reCamera SDK's own inference wrapper (`rc_infer.cpp`) uses the
+pre-allocated zero-copy API — `rknn_create_mem` / `rknn_set_io_mem` once at init,
+then only `rknn_run` + `rknn_mem_sync` per frame — and would be a reasonable
+suspect if we were calling it. We are not: the shipped
+`librecamera_ext.so.1.0.0` exports **only** `rc_ext_*` frame, mask and probe
+entry points and contains no `rknn_*`, no `rc_infer` and no `rc_probe` symbol at
+all. It is the frame/RGA extension, it is absent from the bench process, and the
+bench leaks anyway.
+
+What the leak is *not*, from the numbers: the nine dequantized output tensors of
+this graph are ~4.9 MB, so 43.8 kB is not a leaked output buffer. `mapping_count`
+is flat to the unit, so it is not an unreleased mapping. It is a small, constant,
+per-`rknn_run` allocation on the heap.
+
+**What is not yet nailed down** is whether the missing `free` is in the Cython
+extension or inside `librknnrt` itself. The direct test — counting
+`rknn_outputs_get` against `rknn_outputs_release` — needs `ptrace` on a root
+process, and gdb from the unprivileged fleet account gets
+`ptrace: Operation not permitted`; there is no compiler on the image for an
+`LD_PRELOAD` interposer either. Distinguishing the two requires either running
+gdb from inside the appmgr app or reimplementing the call over `ctypes` against
+`librknnrt` directly, which is also the shape of the real fix: bypass
+`rknn_toolkit_lite2` and own the `rknn_outputs_get` / `rknn_outputs_release`
+pairing, or move to the same pre-allocated `rknn_set_io_mem` path `rc_infer.cpp`
+uses, where no per-frame allocation exists to leak.
+
+**Do not run this unattended.** At 20 fps the observed 40 kB/inference is
+~48 MB/min, which is minutes-to-hours on a 2 GB board — worse than the 12 MB/min
+figure above, which was measured at 5–6 fps. The available mitigation today is a
+supervisor restart on an RSS ceiling; that is a **workaround, not a fix**, and
+its cost is a full `rknn_init` (model reload) per restart.
 
 ## End to end, against the truth video
 
