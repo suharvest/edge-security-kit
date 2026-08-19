@@ -119,6 +119,10 @@ class IntrusionDetectionApp(App):
     source_file = ""
     annotate_path = ""
     mem_probe = 0
+    # Tracker trace. Diagnostic, same class as `mem_probe`/`bench_infer`: not
+    # in the manifest's config_schema, so it is reachable from appctl but never
+    # from the app's settings UI.
+    trace_dir = ""
     malloc_tune = 0
     # Which native path drives the NPU. Not a tuning knob -- it selects between
     # a leaking implementation and a non-leaking one, and the default is the
@@ -268,6 +272,29 @@ class IntrusionDetectionApp(App):
             input_size=self.net_size,
         )
         self.tracker = IoUTracker(float(self.track_iou), float(self.track_max_lost))
+
+        # Tracker trace (diagnostic, off unless ESK_TRACE_DIR is set). It is
+        # wired here rather than behind a config key because it is not a
+        # product feature -- it writes a JSONL line per frame and raw frames
+        # around every id change, and nothing about the published payload
+        # changes when it is on.
+        self._tracer = None
+        trace_dir = _env("ESK_TRACE_DIR", self.trace_dir)
+        if trace_dir:
+            from esk.trace import Tracer
+
+            self._tracer = Tracer(
+                trace_dir,
+                ring=int(_env("ESK_TRACE_RING", 8)),
+                after=int(_env("ESK_TRACE_AFTER", 4)),
+                max_events=int(_env("ESK_TRACE_EVENTS", 8)),
+            )
+            self.detector.debug_conf = float(_env("ESK_TRACE_CONF", 0.05))
+            print(
+                f"[intrusion] trace -> {trace_dir} "
+                f"(candidate conf {self.detector.debug_conf})",
+                flush=True,
+            )
 
         self.frame_id = 0
         # "stopped" until frames flow, not "starting": the contract enum is
@@ -680,8 +707,25 @@ class IntrusionDetectionApp(App):
                 detections = self.detector.detect(canvas, tf)
                 t_infer = time.monotonic()
                 self.inference_times.append(self.detector.last_inference_ms)
-                tracked = self.tracker.update(detections, time.monotonic())
+                track_now = time.monotonic()
+                before = (
+                    self._tracer.snapshot(self.tracker)
+                    if self._tracer is not None
+                    else None
+                )
+                tracked = self.tracker.update(detections, track_now)
                 t_track = time.monotonic()
+                if self._tracer is not None:
+                    self._tracer.frame(
+                        frame_id=self.frame_id + 1,
+                        now=track_now,
+                        tracker=self.tracker,
+                        before=before,
+                        dets=detections,
+                        cand=self.detector.last_debug,
+                        tracked=tracked,
+                        rgb=frame.data,
+                    )
                 self.stage_times["letterbox"].append((t_lb - captured_at) * 1000.0)
                 self.stage_times["store"].append((t_store - t_lb) * 1000.0)
                 self.stage_times["infer"].append((t_infer - t_store) * 1000.0)
@@ -758,6 +802,8 @@ class IntrusionDetectionApp(App):
                 self.preview_server.shutdown()
             self.freq_sampler.stop()
             self._restore_governor()
+            if self._tracer is not None:
+                self._tracer.close()
             self._print_summary()
 
     def _install_stop_handlers(self):

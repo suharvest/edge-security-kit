@@ -290,6 +290,15 @@ class PersonDetector:
         self.last_inference_ms = 0.0
         self._head = None
         self.runtime_version = librknnrt_version()
+        # Diagnostic second decode. Zero = off, and off is the only state the
+        # production path ever sees: `detect()` still decodes at
+        # `conf_threshold` first and returns that list untouched, so enabling
+        # this cannot move a published box. It exists so a trace can say what
+        # the score of a *missing* detection was, which is the difference
+        # between "the detector dropped it" and "the tracker failed to
+        # associate it".
+        self.debug_conf = 0.0
+        self.last_debug: list = []
 
     @property
     def backend(self) -> str:
@@ -314,14 +323,18 @@ class PersonDetector:
 
     def detect(self, rgb_canvas: np.ndarray, tf: LetterboxTransform) -> list:
         outputs = self.infer(rgb_canvas)
+        dets = self._decode(outputs, tf, self.conf_threshold)
+        if self.debug_conf > 0.0:
+            self.last_debug = self._decode(outputs, tf, self.debug_conf)
+        return dets
+
+    def _decode(self, outputs: list, tf: LetterboxTransform, conf: float) -> list:
         if len(outputs) == 1:
             self._head = "ultralytics"
-            return decode_person_head(
-                outputs[0], tf, self.conf_threshold, self.iou_threshold
-            )
+            return decode_person_head(outputs[0], tf, conf, self.iou_threshold)
         self._head = "zoo"
         return decode_zoo_head(
-            outputs, tf, self.conf_threshold, self.iou_threshold, self.input_size
+            outputs, tf, conf, self.iou_threshold, self.input_size
         )
 
 

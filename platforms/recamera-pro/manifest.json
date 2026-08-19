@@ -219,6 +219,14 @@
             "default": ""
           },
           {
+            "key": "trace_dir",
+            "type": "string",
+            "apply": "restart",
+            "title": "Write a per-frame tracker trace here (JSONL + frames around every id change)",
+            "title_zh": "把逐帧跟踪轨迹写到此目录（JSONL + 每次 id 变更前后的帧）",
+            "default": ""
+          },
+          {
             "key": "mem_probe",
             "type": "integer",
             "apply": "restart",
