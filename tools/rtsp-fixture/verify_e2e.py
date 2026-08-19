@@ -22,7 +22,8 @@ import threading
 import time
 from pathlib import Path
 
-import paho.mqtt.client as mqtt
+# Imported inside main(): the matching helpers below are unit-tested off recorded
+# runs (test_verify_e2e.py) on machines that have no broker client installed.
 
 # Paths and endpoints are overridable so this runs outside the machine it was
 # written on. Defaults match the layout the acceptance run used.
@@ -34,7 +35,10 @@ MQTT_HOST = os.environ.get("ESK_MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("ESK_MQTT_PORT", "1884"))
 USER = os.environ.get("ESK_HUB_USER", "admin")
 PW = os.environ.get("ESK_HUB_PASSWORD", "e2e-truth-run-2026")
-OBSERVE_S = float(sys.argv[1]) if len(sys.argv) > 1 else 130.0
+try:  # argv[1] is the observation window; importing this module for its matching
+    OBSERVE_S = float(sys.argv[1])  # helpers (tests) leaves argv holding other things
+except (IndexError, ValueError):
+    OBSERVE_S = 130.0
 
 # Device/stream ids are overridable so the same assertions can be pointed at an
 # accelerated platform without forking the harness. ESK_SKIP_ADL runs the truth
@@ -227,7 +231,81 @@ def observed_events(rows):
     return out
 
 
+def assertable_until(rows, t_end):
+    """Latest truth instant this run is allowed to demand an alert for.
+
+    Two edges bound it and the tighter one wins:
+
+    * `t_end`, the tap close -- the alert list is fetched there, so nothing that
+      fires later is in the list;
+    * the last detection the stream published. The clip loops (~31 s) inside a
+      much longer tap, so the truth series is regenerated every loop, and the
+      LAST loop is routinely cut in half by the window. A `zone_enter` instant is
+      itself an observed detection so it can never pass this edge, but a
+      `loitering` instant is entry + `dwell_seconds`: the hub only escalates
+      while it keeps seeing the track inside the zone, so if the stream stops --
+      clip ended, detector restarted, tracker dropped the id -- the escalation
+      never happens. Demanding it reports a failure for an alert that legitimately
+      cannot exist.
+
+    One tolerance of margin, because an alert lands a few tens of ms after its
+    instant.
+    """
+    t_obs_end = max((r["ts_ms"] for r in rows), default=t_end)
+    return min(t_end, t_obs_end) - TOL_S * 1000.0
+
+
+def assign_nearest(alerts, wants, tol_ms):
+    """Pair alerts with truth instants by smallest |Δt| first, globally.
+
+    Returns (pairs, extra_alerts, missing_wants).
+
+    Not in id order, and not "for each alert take its nearest unused truth".
+    Both of those cascade: ONE unpaired alert -- a hub that fires an extra
+    `zone_enter`, or a leading one for an entry that happened before the tap
+    opened -- makes every following alert grab the NEXT loop's instant, so a
+    single anomaly is reported as N failures each off by exactly one clip period
+    (~31 s). That is the "leading zone_enter artefact" written up in the RK3588,
+    RK3576 and Jetson platform READMEs: the artefact was one alert, the five
+    failures were this matcher.
+
+    Matching globally on |Δt| leaves the anomaly reported once, as itself, and
+    every correct alert still paired with the instant it belongs to. Nothing is
+    suppressed: an alert with no instant within `tol_ms` comes back in
+    `extra_alerts`, an instant with no alert in `missing_wants`, and both are
+    failures at the call site.
+    """
+    cands = sorted(
+        (abs(a["received_ms"] - w["truth_ts_ms"]), ia, iw)
+        for ia, a in enumerate(alerts)
+        for iw, w in enumerate(wants)
+        if a["track_id"] == w["track_id"])
+    used_a: set[int] = set()
+    used_w: set[int] = set()
+    pairs = []
+    for d, ia, iw in cands:
+        if d > tol_ms or ia in used_a or iw in used_w:
+            continue
+        used_a.add(ia)
+        used_w.add(iw)
+        pairs.append((alerts[ia], wants[iw]))
+    pairs.sort(key=lambda p: p[0]["id"])   # |Δt| decided the pairing, id orders it
+    return (pairs,
+            [a for i, a in enumerate(alerts) if i not in used_a],
+            [w for i, w in enumerate(wants) if i not in used_w])
+
+
+def nearest_gap_s(alert, wants):
+    """Signed seconds from `alert` to the closest truth instant, for messages."""
+    if not wants:
+        return None
+    return min(((alert["received_ms"] - w["truth_ts_ms"]) / 1000.0 for w in wants),
+               key=abs)
+
+
 def main() -> int:
+    import paho.mqtt.client as mqtt
+
     OUT.mkdir(parents=True, exist_ok=True)
     COOKIE.unlink(missing_ok=True)
 
@@ -292,14 +370,17 @@ def main() -> int:
     (OUT / "alignment.json").write_text(json.dumps(al, indent=2))
 
     print("\n== observed ground-truth instants (from the detections the hub judged)")
-    # The mirror of the alert-window filter below: a truth instant that falls
-    # after the tap closed (a loitering escalation is entry + dwell_seconds, so
-    # the last entry in the window routinely escalates outside it) has its alert
-    # outside the fetched list by construction, and would be reported as a
-    # missing alert. One tolerance of margin, because an alert lands a few tens
-    # of ms after its instant.
-    obs = [e for e in observed_events(trows)
-           if e["truth_ts_ms"] <= t_end - TOL_S * 1000.0]
+    # The mirror of the alert-window filter below -- see assertable_until().
+    t_assert_end = assertable_until(trows, t_end)
+    all_obs = observed_events(trows)
+    obs = [e for e in all_obs if e["truth_ts_ms"] <= t_assert_end]
+    dropped = [e for e in all_obs if e["truth_ts_ms"] > t_assert_end]
+    if dropped:
+        print(f"  ({len(dropped)} instant(s) past the observation edge "
+              f"t+{(t_assert_end - t_begin) / 1000:.3f}s not asserted: "
+              + ", ".join(f"{e['event_type']}@t+"
+                          f"{(e['truth_ts_ms'] - t_begin) / 1000:.3f}s"
+                          for e in dropped) + ")")
     for e in obs:
         print(f"  t+{(e['truth_ts_ms'] - t_begin) / 1000:7.3f}s {e['event_type']:11s} "
               f"{e.get('direction') or '':8s} track={e.get('track_id')} "
@@ -379,18 +460,7 @@ def main() -> int:
         ng = len([a for a in z_got if a["track_id"] == tid])
         if nw != ng:
             fails.append(f"zone_enter track {tid}: {ng} alerts for {nw} truth entries")
-    used_z: set[int] = set()
-    pairs = []
-    for a in z_got:
-        cands = [(i, e) for i, e in enumerate(z_want)
-                 if i not in used_z and e["track_id"] == a["track_id"]]
-        if not cands:
-            fails.append(f"zone_enter alert {a['id']} (track {a['track_id']}): "
-                         f"no unused truth entry for that track")
-            continue
-        i, e = min(cands, key=lambda p: abs(p[1]["truth_ts_ms"] - a["received_ms"]))
-        used_z.add(i)
-        pairs.append((a, e))
+    pairs, extra_z, missing_z = assign_nearest(z_got, z_want, TOL_S * 1000.0)
     for a, e in pairs:
         err = (a["received_ms"] - e["truth_ts_ms"]) / 1000.0
         matched.append({"id": a["id"], "event_type": "zone_enter",
@@ -399,8 +469,31 @@ def main() -> int:
                         "track_id": a["track_id"], "truth_ts_ms": e["truth_ts_ms"],
                         "alert_received_ms": a["received_ms"], "err_s": round(err, 4),
                         "truth_frame_id": e["frame_id"], "role": "first"})
-        if abs(err) > TOL_S:
-            fails.append(f"zone_enter alert {a['id']}: err {err:.3f}s > {TOL_S}s")
+    # Everything the assignment could not place is a failure, reported once and
+    # as itself. `nearest` is only there to say how far off it was.
+    for a in extra_z:
+        near = nearest_gap_s(a, [e for e in z_want if e["track_id"] == a["track_id"]])
+        matched.append({"id": a["id"], "event_type": "zone_enter",
+                        "rule_name": a["rule_name"], "direction": None,
+                        "dwell_s": None, "snapshot_state": a["snapshot_state"],
+                        "track_id": a["track_id"], "truth_ts_ms": None,
+                        "alert_received_ms": a["received_ms"], "err_s": None,
+                        "truth_frame_id": None, "role": "unmatched"})
+        fails.append(f"zone_enter alert {a['id']} (track {a['track_id']}): no truth "
+                     f"entry within {TOL_S}s"
+                     + (f" (nearest {near:+.3f}s)" if near is not None else
+                        " (no truth entry for that track at all)"))
+    for e in missing_z:
+        where = (f"the truth entry at t+{(e['truth_ts_ms'] - t_begin) / 1000:.3f}s "
+                 f"(track {e['track_id']})")
+        if e["track_id"] in edge_tracks:
+            # Same reasoning as the count check above: a track alive at either
+            # edge of the window has history the harness cannot see. Reported,
+            # not asserted.
+            print(f"  NOTE no zone_enter alert within {TOL_S}s of {where} "
+                  f"-- track touches a window edge, not asserted")
+        else:
+            fails.append(f"zone_enter: no alert within {TOL_S}s of {where}")
 
     # loitering: one first-fire per ZONE ENTRY, not per track.
     #

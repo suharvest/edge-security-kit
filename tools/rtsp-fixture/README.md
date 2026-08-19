@@ -115,6 +115,39 @@ Overridable variables (all have defaults matching the layout above):
 path (`cd platforms/generic && uv run python …/verify_e2e.py`) or point
 `ESK_GENERIC_DIR` at a checkout whose deps are installed.
 
+### How the harness matches alerts to truth instants
+
+The clip loops (~31 s) inside a much longer observation window, so the truth
+series is regenerated per loop from the tapped detections — a 130 s window holds
+about four crossings, four zone entries and four escalations, not one of each.
+
+Two rules keep the accounting honest, and both exist because breaking them
+produced failures that looked like platform regressions:
+
+**Alerts pair with truth instants by smallest |Δt|, globally** — not in id order,
+and not "for each alert, its nearest unused instant". Both of those cascade: one
+unpaired alert makes every later alert take the *next* loop's instant, so a
+single anomaly is reported as N failures each off by exactly one clip period.
+That is what the "leading `zone_enter` artefact" in the RK3588, RK3576 and Jetson
+platform READMEs actually was — the artefact was one alert, the five failures
+were the matcher. Those runs blamed the observation phase and re-ran; the
+matcher was never the suspect. Nothing is suppressed by the fix: an alert with no
+instant within `TOL_S`, or an instant with no alert, is still a failure.
+
+**A truth instant is only asserted if the run watched long enough to see it
+answered** (`assertable_until`). The tap close is one edge; the last detection
+the stream published is the other, and it is often tighter. A `loitering` instant
+is entry + `dwell_seconds`, and the hub only escalates while it keeps seeing the
+track inside the zone — so an entry near the end of the window never escalates
+once the stream stops, and demanding its alert fails on something that cannot
+exist. A `zone_enter` instant is itself an observed detection, so it never hits
+this edge.
+
+`test_verify_e2e.py` (`python3 test_verify_e2e.py`, no broker or device needed)
+pins both against a recorded RK3576 run, in both directions: the recorded run
+must report exactly one complaint, and corrupted variants of it — every alert 5 s
+late, an alert deleted, a wrong `track_id` — must still report.
+
 ### Publish rate is part of the fixture
 
 The truth clip is published at 5 fps, not 15, and that is a correctness
