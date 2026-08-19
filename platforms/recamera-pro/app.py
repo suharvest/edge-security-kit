@@ -134,6 +134,14 @@ class IntrusionDetectionApp(App):
     bench_mode = "infer"
     bench_seconds = 600.0
     bench_tag = "bench"
+    # `ctypes_leak` is the positive control and it retains every output buffer
+    # on purpose: nine float32 tensors, ~4.9 MB per inference. Unthrottled that
+    # is ~120 MB/s against ~1.2 GB of free RAM, which takes the board off the
+    # network in about ten seconds -- observed, not hypothetical. The control is
+    # only required to make a leak *visible*, so it runs rate-capped and
+    # iteration-capped; both default to off for every other mode.
+    bench_fps = 0.0
+    bench_max_iterations = 0
 
     # ------------------------------------------------------------------ setup
 
@@ -162,7 +170,8 @@ class IntrusionDetectionApp(App):
         self._bench_mode = _env("ESK_BENCH_MODE", self.bench_mode)
         self._bench_model = _env("ESK_BENCH_MODEL", self.bench_model)
         self._bench_seconds = float(_env("ESK_BENCH_SECONDS", self.bench_seconds))
-        self._bench_fps = float(_env("ESK_BENCH_FPS", 0.0))
+        self._bench_fps = float(_env("ESK_BENCH_FPS", self.bench_fps))
+        self._bench_max_iter = int(_env("ESK_BENCH_MAX_ITER", self.bench_max_iterations))
         self._bench_tag = _env("ESK_BENCH_TAG", self.bench_tag)
         self._bench_out = _env(
             "ESK_BENCH_OUT", f"/userdata/esk-fixture/bench-{self._bench_tag}.json"
@@ -520,6 +529,7 @@ class IntrusionDetectionApp(App):
                 out_path=self._bench_out,
                 mode=self._bench_mode,
                 target_fps=self._bench_fps,
+                max_iterations=self._bench_max_iter,
                 label=f"{self._bench_mode}@{self.cpu_governor or 'unlocked'}",
             )
         finally:

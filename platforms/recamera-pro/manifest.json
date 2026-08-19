@@ -280,6 +280,27 @@
             "title": "Bench output tag (result goes to bench-<tag>.json)",
             "title_zh": "裸循环输出标签（结果写入 bench-<tag>.json）",
             "default": "bench"
+          },
+          {
+            "key": "bench_fps",
+            "type": "number",
+            "apply": "restart",
+            "title": "Bench loop rate cap (0 = flat out)",
+            "title_zh": "裸循环速率上限（0 表示不限速）",
+            "min": 0,
+            "max": 60,
+            "step": 0.5,
+            "default": 0
+          },
+          {
+            "key": "bench_max_iterations",
+            "type": "integer",
+            "apply": "restart",
+            "title": "Stop the bench after N inferences (0 = no cap; guards the leak control)",
+            "title_zh": "推理 N 次后结束裸循环（0 表示不限；用于给泄漏对照兜底）",
+            "min": 0,
+            "max": 10000000,
+            "default": 0
           }
         ]
       }

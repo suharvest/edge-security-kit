@@ -20,6 +20,15 @@ Two controls make the answer harder to fake:
     the same loop, the same cadence, the same sampling, **no inference call**.
     A leak that shows up here is the harness, not the runtime.
 
+``mode="ctypes_get"`` / ``"ctypes_run"`` / ``"ctypes_iomem"`` / ``"ctypes_leak"``
+    the same loop with ``rknn_toolkit_lite2`` taken out of the call path
+    entirely -- ``librknnrt`` driven straight from Python. Same graph, same
+    constant input, same sampler; only the API sequence differs. That is what
+    splits "the Cython extension drops the free" from "``librknnrt`` does", a
+    question no amount of sampling from outside the process can answer. See
+    ``esk/ctypes_infer`` for what each of the four sequences is and which
+    hypothesis each one kills. ``ctypes_leak`` is the positive control.
+
 ``model_path=<other .rknn>``
     the same loop against a different graph. The shipped ``fall-detection`` app
     ran 12 h at a flat 263 MB through this very same ``kit.runtime.engine``
@@ -29,7 +38,16 @@ Two controls make the answer harder to fake:
     story into a measurement.
 
 Samples go to a JSON file rather than stdout because appmgr sends app stdout to
-a root-owned ``logs/app.log`` that the fleet account cannot read.
+a root-owned ``logs/app.log`` that the fleet account cannot read. For the same
+reason ``run_bench`` records any exception into that JSON before re-raising:
+otherwise a crash in the loop is indistinguishable from a run that did nothing.
+
+Every mode here has to run *as an appmgr app*, which is the only reason this is
+wired into ``app.py`` rather than being a standalone script. ``/dev/rknpu`` is
+mode 0600 root:root, the fleet account is uid 1000 with no sudo, and appmgr runs
+apps as root -- a script run over SSH gets "failed to open rknpu module, need to
+insmod rknpu driver" from ``rknn_init``, which reads like a missing kernel module
+and is in fact a permission denial.
 """
 
 from __future__ import annotations
@@ -71,6 +89,24 @@ def _heap_bytes():
     return total
 
 
+def _free_mb():
+    """``MemAvailable`` in MiB -- the headroom the abort guard watches.
+
+    ``MemFree`` would be the wrong number: most of what this board is holding is
+    reclaimable page cache, so ``MemFree`` reads alarmingly low while the box is
+    perfectly healthy. ``MemAvailable`` is the kernel's own estimate of what a
+    new allocation could actually get.
+    """
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return None
+
+
 def _mapping_count():
     try:
         with open("/proc/self/maps") as fh:
@@ -86,6 +122,7 @@ def sample(iterations: int, started: float) -> dict:
         "rss_kb": _rss_kb(),
         "heap_bytes": _heap_bytes(),
         "mapping_count": _mapping_count(),
+        "free_mb": _free_mb(),
         "wall": time.strftime("%H:%M:%S"),
     }
 
@@ -112,6 +149,8 @@ def run_bench(
     out_path: str = "/userdata/esk-fixture/bench.json",
     mode: str = "infer",
     target_fps: float = 0.0,
+    max_iterations: int = 0,
+    min_free_mb: float = 250.0,
     label: str = "",
 ) -> dict:
     """Run the loop and write a sampled RSS curve to ``out_path``.
@@ -123,7 +162,21 @@ def run_bench(
     pipeline; 0 runs flat out, which reaches the same iteration count sooner.
     """
     owned = None
-    if model is None:
+    describe = None
+    if mode.startswith("ctypes_"):
+        # The ctypes variants exist to split "which native layer drops the
+        # free" -- they must NOT reuse the rknnlite handle, because that handle
+        # is the thing under suspicion. Each opens its own rknn_context against
+        # the same graph file. See esk/ctypes_infer for what the four do.
+        from esk.ctypes_infer import CtypesRknnModel
+
+        path = model_path or getattr(model, "path", "")
+        if not path:
+            raise ValueError(f"bench mode {mode!r} needs a model path")
+        model_path = path
+        owned = model = CtypesRknnModel(path, mode=mode[len("ctypes_"):])
+        describe = model.describe()
+    elif model is None:
         if not model_path:
             raise ValueError("run_bench needs either a model handle or a model_path")
         owned = model = load_model(model_path)
@@ -150,7 +203,10 @@ def run_bench(
         "seconds_requested": seconds,
         "sample_every_s": sample_every_s,
         "target_fps": target_fps,
+        "max_iterations": max_iterations,
+        "min_free_mb": min_free_mb,
         "pid": os.getpid(),
+        "describe": describe,
         "samples": samples,
     }
 
@@ -191,7 +247,7 @@ def run_bench(
                 next_sample = now + sample_every_s
                 flush()
 
-            if mode == "infer":
+            if mode == "infer" or mode.startswith("ctypes_"):
                 t0 = time.perf_counter()
                 outputs = model.infer(frame)
                 infer_ms.append((time.perf_counter() - t0) * 1000.0)
@@ -206,12 +262,42 @@ def run_bench(
                 raise ValueError(f"unknown bench mode {mode!r}")
 
             iterations += 1
+            if max_iterations and iterations >= max_iterations:
+                result["stopped_by"] = "max_iterations"
+                break
+            # Headroom guard. The ctypes_leak control retains ~4.9 MB of output
+            # per inference by design; unthrottled that took this board off the
+            # network in ten seconds and cost a reboot. A control only has to
+            # make the leak *visible*, and by the time headroom is this low it
+            # already has -- so stop, and leave the samples behind rather than
+            # letting the OOM killer decide what survives. Checked every
+            # iteration, not every N: at 4.9 MB a call even N=32 is 157 MB of
+            # blind spot, which is most of the headroom this guard is defending.
+            # A /proc/meminfo read is tens of microseconds against a ~36 ms
+            # inference, so the sampling cost is not the constraint here.
+            free_mb = _free_mb()
+            if free_mb is not None and free_mb < min_free_mb:
+                result["stopped_by"] = "min_free_mb"
+                result["stopped_free_mb"] = round(free_mb, 1)
+                break
             if len(infer_ms) > 20000:
                 del infer_ms[:10000]
             if interval:
                 slack = interval - (time.monotonic() - now)
                 if slack > 0:
                     time.sleep(slack)
+    except BaseException as exc:  # noqa: BLE001 -- recorded, then re-raised
+        # Under appmgr the app's stdout is a root-owned ``logs/app.log`` the
+        # fleet account cannot read, so a crash in here would surface only as
+        # ``"iterations": 0`` with no reason attached -- which is exactly how
+        # the first ctypes run failed. ``out_path`` is the one artifact that is
+        # world-readable, so the failure has to land in it. ``flush()`` runs
+        # after this block (``finally``), so the fields are already set by then.
+        import traceback
+
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["traceback"] = traceback.format_exc()
+        raise
     finally:
         samples.append(sample(iterations, started))
         flush()
