@@ -119,7 +119,20 @@ class Hub:
 
         The detections path resets on its own too — this covers a device whose
         heartbeat lands before its first frame of the new session.
+
+        It must not reset a generation the detections path has already adopted.
+        The status topic is the slower of the two: a heartbeat is 30 s apart, and
+        a device whose first status never reaches the registry — rejected by the
+        contract validator, lost across a reconnect, published before the hub
+        subscribed — first announces its new session_id a whole interval after
+        its frames did. Resetting then wipes live per-track state mid-scene: a
+        track that never left the zone loses its entry instant, so the escalation
+        it was owed comes out as a second ``zone_enter`` instead of ``loitering``.
+        Observed once per detector session, ~30 s in, on every reCamera Pro
+        acceptance run (alerts 293, 346, 408, 437, 452, 480, 510).
         """
+        if self.engine.adopted_session(device_id) == session_id:
+            return
         self.engine.reset_device(device_id)
         self.alerts.reset_session(device_id)
 

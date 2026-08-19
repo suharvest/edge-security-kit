@@ -69,6 +69,17 @@ class RuleEngine:
     def reset_device(self, device_id: str) -> None:
         self._devices.pop(device_id, None)
 
+    def adopted_session(self, device_id: str) -> str | None:
+        """The session_id whose frames this engine currently holds state for.
+
+        ``None`` until the device's first detection message. Callers that reset
+        the generation from a slower channel (the status topic) compare against
+        it, so a late announcement of a session the frames already established
+        does not wipe that session's live state.
+        """
+        dev = self._devices.get(device_id)
+        return None if dev is None else dev.session_id
+
     def track_count(self, device_id: str, stream_id: str) -> int:
         dev = self._devices.get(device_id)
         if dev is None or stream_id not in dev.streams:
