@@ -270,7 +270,12 @@ class IntrusionDetectionApp(App):
         self.tracker = IoUTracker(float(self.track_iou), float(self.track_max_lost))
 
         self.frame_id = 0
-        self.stream_state = "starting"
+        # "stopped" until frames flow, not "starting": the contract enum is
+        # running/reconnecting/stopped, and a value outside it makes the hub
+        # drop the whole status message. That used to leave the registry a
+        # generation behind for 30 s, long enough for the next heartbeat to
+        # reset a track that was mid-dwell.
+        self.stream_state = "stopped"
         # Replay is a CPU decode by construction; the camera path is expected to
         # be the zero-copy ISP broker. `decode_path` is not fixed here -- it is
         # RESOLVED from the source object once frames start flowing
