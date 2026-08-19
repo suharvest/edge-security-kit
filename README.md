@@ -28,24 +28,31 @@ Same 1280×720 H.264 source, same truth video, same assertions.
 | | Jetson Orin NX 16GB | Radxa Rock 5T (RK3588) | LubanCat-3 (RK3576) | reCamera Pro (RV1126B) |
 |---|---|---|---|---|
 | Accelerator | TensorRT 10.3, FP16 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 |
-| Inference p50, in pipeline | 4.16 ms | 36.2–44.5 ms | 23.9 ms | 41.8 ms at 594 MHz |
-| Inference p95, in pipeline | 4.19 ms | 55.8–56.2 ms | 27.9 ms | — |
-| Full pipeline p50 | 6.99 ms | 38.1–46.3 ms | 26.2 ms | 47.4 ms (camera path) |
+| Inference p50, in pipeline | 4.16 ms | 36.2–44.5 ms | 23.9 ms | 36.6 ms (32.3 ms clock-pinned) |
+| Inference p95, in pipeline | 4.19 ms | 55.8–56.2 ms | 27.9 ms | 46.8 ms (36.3 ms clock-pinned) |
+| Full pipeline p50 | 6.99 ms | 38.1–46.3 ms | 26.2 ms | 39.7 ms (camera path) |
 | Detector CPU | 5.5% of one core | 16.4–17.9% of one core | 8.6–14.0% of one core | 27% of one core |
 | Detector RSS | 310 MB | 214 MB at start | 200 MB | — |
 | Accelerator busy | GR3D 0% in 215 of 239 1 s samples | NPU Core0 8–11%, cores 1–2 idle | NPU Core0 5–6%, Core1 idle | — |
 | Board state while measured | idle, load avg 0.00 | 8 containers, 2 above 1% CPU | idle, no containers | — |
 | Decode | NVDEC, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | none — ISP dma-buf, zero-copy |
 | Single-stream ceiling | 167 inferences/s | 31.4 inferences/s | not measured | not measured |
-| Sustained fps | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) |
+| Sustained fps | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) | 18.8 (compute-limited) |
 
 **The reCamera Pro column is not like-for-like.** The other three boards decode
-a replay clip; the camera takes ISP frames over dma-buf and decodes nothing at
-all, so its pipeline figure covers a different set of stages. Its inference
-number is also higher than the earlier 29.9 ms *because* the pipeline got
-cheaper: with the per-frame CPU work nearly halved the interactive governor
-settles the board at 594 MHz, and the host side of the RKNN call is CPU-bound.
-Total CPU time per frame fell from 85.8 ms to 44.9 ms.
+a replay clip at a 5 fps source rate; the camera takes ISP frames over dma-buf,
+decodes nothing at all, and runs compute-limited at 18.8 fps, so neither its
+pipeline figure nor its fps compares directly.
+
+Its inference number is quoted twice because the shipped `interactive` governor
+makes it a moving target. Pinned measurements, ~5 min each with the frequency
+sampled rather than read once: 594 MHz → 47.8 ms, `interactive` (mean 1017 MHz)
+→ 36.6 ms, 1.608 GHz → 32.3 ms. **32% of the inference time at 594 MHz is the
+downclock**, and the call decomposes as 23.2 ms clock-invariant NPU work plus a
+CPU-bound host share of 9.1 ms at 1.608 GHz or 24.6 ms at 594 MHz. Pinning is
+not recommended as a product setting: the policy covers all four cores, so it
+holds the whole SoC at maximum to buy 4.4 ms of p50 that nothing downstream is
+waiting on.
 
 The Orin NX and RK3588 columns were re-measured on 2026-08-18 under the method
 below. The RK3576 and reCamera Pro columns are earlier runs on their own boards
@@ -194,15 +201,30 @@ with no failures, and broker, hub and detector all run on the camera. It takes
 ISP frames over dma-buf and letterboxes on RGA, so on the camera path it decodes
 nothing — that halved per-frame CPU time, from 85.8 ms to 44.9 ms.
 
-Two caveats stay attached. It carries no accuracy sweep. And its RSS grows
-~13 MB/min on both frame paths, which is localized but not fixed: the growth is
-entirely anonymous `[heap]`, Python object counts and mapping counts stay flat,
-and glibc's free pool shrinks — so it is malloc'd memory a C extension holds,
-with the RKNN runtime the only native component common to both paths. Against
-that, `fall-detection` uses the same wrapper and held 263 MB over 12 hours, so
-if it is the runtime it depends on output shape. The deciding experiment is a
-bare inference loop, which needs root for `/dev/rknpu`. On a 2 GB board this is
-hours to trouble, so treat long-running camera deployments as unproven until it
-is settled.
+Two caveats stay attached. It carries no accuracy sweep. And it leaks
+**43.8 kB per inference**, localized but not fixed.
+
+A bare loop settles what that is: one pre-allocated input, no frame source, RGA,
+tracker, MQTT or JPEG. 15 842 inferences grew RSS by 544 MB; the same loop with
+the inference call removed ran 273 149 iterations and moved RSS by **zero**. So
+it is the `infer()` call, and it is a small constant allocation per `rknn_run`
+rather than a leaked output buffer — the nine dequantized tensors are ~4.9 MB,
+three orders of magnitude off. It is not output-shape specific either: the pose
+model leaks the same way on the same wrapper.
+
+The path is `kit.runtime.engine.RknnModel.infer` → `rknnlite.api.RKNNLite.inference`
+→ `rknn_runtime.cpython-311-aarch64-linux-gnu.so` → `librknnrt.so`, and that
+last library imports both `rknn_outputs_get` and `rknn_outputs_release`. Which
+side drops the `free` needs the call counts, and gdb from an unprivileged
+account cannot attach to the root process (`ptrace: Operation not permitted`)
+while the image ships no compiler for an `LD_PRELOAD` interposer. That is the
+next step, and it is also the shape of the fix: own the get/release pairing
+through ctypes, or move to the pre-allocated `rknn_set_io_mem` path.
+
+At 18.8 fps this is ~50 MB/min, so treat long-running camera deployments as
+unproven until it is settled. The vendor SDK's own `rc_infer.cpp` is *not*
+implicated — `librecamera_ext.so` exports only `rc_ext_*` frame and probe entry
+points, no `rknn_*` symbols at all, so its pre-allocated zero-copy path is not
+the one being called.
 
 Not built: Hailo. Not measured: anything above two concurrent streams.
