@@ -237,6 +237,14 @@
             "default": ""
           },
           {
+            "key": "engine",
+            "type": "string",
+            "apply": "restart",
+            "title": "NPU call path: ctypes (default, no leak) or rknnlite (leaks 43.8 kB/inference)",
+            "title_zh": "NPU 调用路径：ctypes（默认，无泄漏）或 rknnlite（每次推理泄漏 43.8 kB）",
+            "default": "ctypes"
+          },
+          {
             "key": "bench_infer",
             "type": "integer",
             "apply": "restart",

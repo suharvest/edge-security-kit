@@ -120,6 +120,33 @@ class IntrusionDetectionApp(App):
     annotate_path = ""
     mem_probe = 0
     malloc_tune = 0
+    # Which native path drives the NPU. Not a tuning knob -- it selects between
+    # a leaking implementation and a non-leaking one, and the default is the
+    # fix. `rknnlite` is kept only so the regression can be re-measured on
+    # demand without reinstalling an old package.
+    #
+    #   rknnlite -> kit.runtime.engine.RknnLiteModel, i.e. RKNNLite.inference
+    #               over rknn_runtime.cpython-311-aarch64-linux-gnu.so. Leaks
+    #               43.8 kB per inference on this graph (README, "The bare loop
+    #               settles it") -- ~2.2 MB/min at 18.8 fps, an OOM in hours.
+    #   ctypes   -> kit.runtime.ctypes_rknn.CtypesRknnModel, which performs the
+    #               *same* librknnrt sequence the Cython extension does
+    #               (rknn_inputs_set + rknn_run + rknn_outputs_get +
+    #               rknn_outputs_release, want_float=1) and is flat: 6465
+    #               inferences moved [heap] by zero bytes.
+    #
+    # That pair is the whole argument. Both call the identical vendor entry
+    # points with the identical arguments against the identical graph; the only
+    # difference is whether the Cython extension is in the call path. So the
+    # missing free is in the extension, not in librknnrt, and removing the
+    # extension is a fix rather than a workaround -- no periodic context rebuild,
+    # no leak budget, nothing to tune.
+    #
+    # Since that held, the ctypes path moved into `kit` and became the default
+    # for every app on the board; this key now only picks which kit backend to
+    # ask for (`ESK_RKNN_BACKEND`). It stays because the fixture scripts drive
+    # the A/B through it.
+    engine = "ctypes"
     # Diagnostics. Both default to off and neither is a product setting:
     # `cpu_governor` pins the clock so a DVFS-free latency baseline can be taken
     # (and is restored on every exit path -- see esk/cpufreq.GovernorLock), and
@@ -142,6 +169,28 @@ class IntrusionDetectionApp(App):
     # iteration-capped; both default to off for every other mode.
     bench_fps = 0.0
     bench_max_iterations = 0
+
+    # ------------------------------------------------------------- model load
+
+    def _load_model(self, path: str):
+        """Select the kit's NPU backend for this run, then let kit build it.
+
+        The ctypes implementation itself now lives in
+        ``kit.runtime.ctypes_rknn`` and is the kit-wide default, so this method
+        no longer constructs anything -- it only translates this app's
+        ``engine`` config key into the kit's ``ESK_RKNN_BACKEND`` switch. The
+        key is kept because the fixture scripts drive the A/B through it and
+        because re-measuring the rknnlite leak must not require reinstalling an
+        older package; the fall back when ctypes cannot initialise is kit's job
+        and kit prints it.
+        """
+        backend = "rknnlite" if str(self.engine).lower() in (
+            "rknnlite", "lite", "0", "false") else "ctypes"
+        os.environ["ESK_RKNN_BACKEND"] = backend
+        model = super()._load_model(path)
+        print(f"[intrusion] engine={getattr(model, 'backend', backend)} "
+              f"(requested {backend}) for {path}", flush=True)
+        return model
 
     # ------------------------------------------------------------------ setup
 
@@ -499,6 +548,38 @@ class IntrusionDetectionApp(App):
         if result.get("restored"):
             print(f"[intrusion] cpufreq restore: {result}", flush=True)
 
+    def _run_equiv(self):
+        """`bench_mode="equiv"`: prove the two engines return the same numbers.
+
+        Shares the bench entry point because it needs the same thing bench does
+        and nothing else does -- to be an appmgr app, so that ``/dev/rknpu`` is
+        openable. It is not a benchmark: it runs a fixed, small number of
+        inferences and writes a diff, not a curve.
+        """
+        from esk.equiv_check import run_equiv
+
+        model_path = self._bench_model or self.models.det.path
+        video = self.source_file
+        out = _env("ESK_EQUIV_OUT", "/userdata/esk-fixture/equiv.json")
+        print(f"[intrusion] EQUIV model={model_path} video={video or '(none)'} "
+              f"out={out}", flush=True)
+        try:
+            result = run_equiv(
+                model_path=model_path,
+                video_path=video,
+                out_path=out,
+                n_frames=int(self._bench_max_iter or 60),
+                input_size=self.net_size,
+                conf_threshold=float(self.confidence),
+                iou_threshold=float(self.iou),
+            )
+        finally:
+            self.freq_sampler.stop()
+            self._restore_governor()
+            if self.preview_server is not None:
+                self.preview_server.shutdown()
+        print(f"[intrusion] EQUIV done: {result.get('summary')}", flush=True)
+
     def _run_bench(self):
         """Bare inference loop instead of the pipeline (diagnostic mode).
 
@@ -511,6 +592,9 @@ class IntrusionDetectionApp(App):
         from esk.bench_infer import run_bench
 
         self.stream_state = "running"
+        if self._bench_mode == "equiv":
+            self._run_equiv()
+            return
         model = None if self._bench_model else self.models.det
         print(
             f"[intrusion] BENCH mode={self._bench_mode} "
