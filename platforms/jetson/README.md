@@ -451,11 +451,14 @@ so this platform probably does not need the nudge — untested, and left matchin
 RK for comparability.
 
 An earlier run of the same assertions reported five `zone_enter` failures. They
-were one artefact, not five: the run began with the subject already inside the
-zone, so the hub emitted an extra leading `zone_enter` the moment its rules were
-installed, and the harness's in-order matcher then paired every later alert with
-the previous loop's truth instant. The same artefact appears in the RK
-acceptance log (`rk-A`) and clears once the run starts on a clean phase.
+were one anomaly, not five — but the mechanism recorded here originally was
+wrong. The extra leading `zone_enter` at rule install is real; what turned it
+into five failures was the harness matcher, which walked alerts in id order and
+took the nearest *unused* truth instant, so one unpairable alert shifted every
+later alert onto the previous loop's instant. The same cascade is in the RK
+acceptance log (`rk-A`). Fixed in `tools/rtsp-fixture/verify_e2e.py`; a
+counter-example test now pins both the single complaint and the cases that must
+still fail.
 
 ## Tests
 

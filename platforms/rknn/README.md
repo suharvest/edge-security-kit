@@ -558,12 +558,15 @@ inheritance: MPP/RGA emits 640 px wide here too, so a published `cx` can only
 land on a multiple of 1/640 and 0.5 is exactly on that grid.
 
 The first run of these assertions reported five `zone_enter` failures, each off
-by 31.0 s — one truth-video loop period exactly. That is the artefact already
-documented for RK3588 and Jetson: the run began mid-loop with the subject
-already inside the zone, the hub emitted a leading `zone_enter` the moment its
-rules were installed, and the in-order matcher then paired every later alert
-with the previous loop's instant. The table above is the immediately following
-run on the established loop, unchanged in every other respect.
+by 31.0 s — one truth-video loop period exactly. **That was a harness bug, and
+the explanation recorded here originally was wrong.** The leading `zone_enter`
+at rule install is real, but it did not cause the other four: the matcher
+walked alerts in id order and took the nearest *unused* truth instant, so a
+single unpairable alert pushed every later alert onto the next loop's instant.
+One anomaly, N failures. Fixed in `tools/rtsp-fixture/verify_e2e.py` by a
+global smallest-delta assignment; the recorded run now reports one complaint
+instead of five. The table above is the immediately following run on the
+established loop, unchanged in every other respect.
 
 ### Letterbox, checked on the vertical axis
 
