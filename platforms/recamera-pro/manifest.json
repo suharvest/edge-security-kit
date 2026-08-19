@@ -227,6 +227,59 @@
             "min": 0,
             "max": 1,
             "default": 0
+          },
+          {
+            "key": "cpu_governor",
+            "type": "string",
+            "apply": "restart",
+            "title": "Pin the CPU governor for this run (measurement only; restored on exit)",
+            "title_zh": "本次运行锁定 CPU 调频策略（仅用于测量，退出时恢复）",
+            "default": ""
+          },
+          {
+            "key": "bench_infer",
+            "type": "integer",
+            "apply": "restart",
+            "title": "Replace the pipeline with a bare inference loop (diagnostic)",
+            "title_zh": "用裸推理循环替代流水线（诊断用）",
+            "min": 0,
+            "max": 1,
+            "default": 0
+          },
+          {
+            "key": "bench_mode",
+            "type": "string",
+            "apply": "restart",
+            "title": "Bench loop mode: infer, or idle for the no-inference control",
+            "title_zh": "裸循环模式：infer，或 idle 作为不推理的对照",
+            "default": "infer"
+          },
+          {
+            "key": "bench_model",
+            "type": "string",
+            "apply": "restart",
+            "title": "Bench a different .rknn instead of this app's model",
+            "title_zh": "用另一个 .rknn 替代本应用模型做裸循环",
+            "default": ""
+          },
+          {
+            "key": "bench_seconds",
+            "type": "number",
+            "apply": "restart",
+            "title": "Bench duration (s)",
+            "title_zh": "裸循环时长（秒）",
+            "min": 10,
+            "max": 7200,
+            "step": 10,
+            "default": 600
+          },
+          {
+            "key": "bench_tag",
+            "type": "string",
+            "apply": "restart",
+            "title": "Bench output tag (result goes to bench-<tag>.json)",
+            "title_zh": "裸循环输出标签（结果写入 bench-<tag>.json）",
+            "default": "bench"
           }
         ]
       }

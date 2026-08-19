@@ -61,6 +61,7 @@ import numpy as np
 
 from kit.app import App, run_app
 
+from esk import cpufreq
 from esk.letterbox import (
     LetterboxTransform,
     frame_norm_to_pixels,
@@ -119,6 +120,20 @@ class IntrusionDetectionApp(App):
     annotate_path = ""
     mem_probe = 0
     malloc_tune = 0
+    # Diagnostics. Both default to off and neither is a product setting:
+    # `cpu_governor` pins the clock so a DVFS-free latency baseline can be taken
+    # (and is restored on every exit path -- see esk/cpufreq.GovernorLock), and
+    # `bench_infer` replaces the whole pipeline with a bare inference loop to
+    # test whether the RSS growth survives without the frame path.
+    cpu_governor = ""
+    bench_infer = 0
+    # appmgr owns the app's environment, so a diagnostic that is only reachable
+    # through ESK_* variables is not reachable on the one device it has to run
+    # on. These are config_schema keys for that reason, not env-only knobs.
+    bench_model = ""
+    bench_mode = "infer"
+    bench_seconds = 600.0
+    bench_tag = "bench"
 
     # ------------------------------------------------------------------ setup
 
@@ -141,6 +156,17 @@ class IntrusionDetectionApp(App):
         )
         self.source_file = _env("ESK_SOURCE_FILE", self.source_file)
         self._annotate_path = _env("ESK_ANNOTATE", self.annotate_path)
+        self._bench = str(_env("ESK_BENCH_INFER", self.bench_infer)) not in (
+            "0", "", "False",
+        )
+        self._bench_mode = _env("ESK_BENCH_MODE", self.bench_mode)
+        self._bench_model = _env("ESK_BENCH_MODEL", self.bench_model)
+        self._bench_seconds = float(_env("ESK_BENCH_SECONDS", self.bench_seconds))
+        self._bench_fps = float(_env("ESK_BENCH_FPS", 0.0))
+        self._bench_tag = _env("ESK_BENCH_TAG", self.bench_tag)
+        self._bench_out = _env(
+            "ESK_BENCH_OUT", f"/userdata/esk-fixture/bench-{self._bench_tag}.json"
+        )
         self._max_seconds = float(_env("ESK_SECONDS", 0.0))
         self._max_frames = int(_env("ESK_FRAMES", 0))
         # Replay mode drives its own source, so the kit must not ALSO open the
@@ -149,6 +175,30 @@ class IntrusionDetectionApp(App):
         # window where a config-driven answer is still in time.
         if self.source_file:
             self.needs_frames = False
+        # The bench loop feeds itself a constant array; opening the camera would
+        # put the ISP path back into the very process the experiment exists to
+        # empty out.
+        if self._bench:
+            self.needs_frames = False
+
+        # Clock control. Applied before the model is loaded so the first
+        # inference is already at the pinned frequency, restored by run()'s
+        # finally block and by the atexit hook below -- appmgr's app switch
+        # sends SIGTERM, and a governor left on `performance` would outlive this
+        # process and quietly burn power on an idle camera.
+        self._gov_lock = None
+        self.cpu_governor = _env("ESK_CPU_GOVERNOR", self.cpu_governor)
+        self.cpufreq_before = cpufreq.snapshot()
+        if self.cpu_governor:
+            import atexit
+
+            self._gov_lock = cpufreq.GovernorLock(self.cpu_governor)
+            applied = self._gov_lock.apply()
+            atexit.register(self._restore_governor)
+            print(f"[intrusion] cpufreq lock: {applied}", flush=True)
+        # Sampled unconditionally: a latency number quoted without the clock it
+        # was measured at is not comparable with anything.
+        self.freq_sampler = cpufreq.FreqSampler(1.0).start()
 
         # start() resolved the model input side from the manifest before
         # calling setup(); the class attribute is only the fallback.
@@ -326,6 +376,15 @@ class IntrusionDetectionApp(App):
             "fps": round(self.measured_fps(), 2),
             "stage_ms_p50": {k: pct(v, 0.5) for k, v in self.stage_times.items()},
             "stage_ms_p95": {k: pct(v, 0.95) for k, v in self.stage_times.items()},
+            "inference_ms_p50": pct(self.inference_times, 0.5),
+            "inference_ms_p95": pct(self.inference_times, 0.95),
+            "pipeline_ms_p50": pct(self.pipeline_times, 0.5),
+            "pipeline_ms_p95": pct(self.pipeline_times, 0.95),
+            # Latency without the clock it was measured at is not comparable
+            # across runs on a board whose governor moves 594 MHz - 1.608 GHz.
+            "cpu_governor_requested": self.cpu_governor,
+            "cpufreq_now": cpufreq.snapshot(),
+            "cpufreq_samples": self.freq_sampler.report(),
         }
 
     def _model_canvas(self, frame, tf: LetterboxTransform):
@@ -423,7 +482,74 @@ class IntrusionDetectionApp(App):
                 self.tick()
                 yield frame
 
+    def _restore_governor(self) -> None:
+        """Put the governor back. Idempotent -- three exit paths call it."""
+        if self._gov_lock is None:
+            return
+        result = self._gov_lock.restore()
+        if result.get("restored"):
+            print(f"[intrusion] cpufreq restore: {result}", flush=True)
+
+    def _run_bench(self):
+        """Bare inference loop instead of the pipeline (diagnostic mode).
+
+        Everything the normal ``run()`` would start -- MQTT, the frame source,
+        the tracker -- is skipped, so that a RSS curve measured here can only be
+        attributed to the RKNN call itself. The preview server stays up because
+        it is the only way to read the process's own ``/debug/memory`` while it
+        runs, and it allocates nothing per iteration.
+        """
+        from esk.bench_infer import run_bench
+
+        self.stream_state = "running"
+        model = None if self._bench_model else self.models.det
+        print(
+            f"[intrusion] BENCH mode={self._bench_mode} "
+            f"model={self._bench_model or self.models.det.path} "
+            f"seconds={self._bench_seconds} fps={self._bench_fps or 'max'} "
+            f"out={self._bench_out}",
+            flush=True,
+        )
+        try:
+            result = run_bench(
+                model=model,
+                model_path=self._bench_model,
+                input_shape=(1, self.net_size, self.net_size, 3),
+                seconds=self._bench_seconds,
+                sample_every_s=30.0,
+                out_path=self._bench_out,
+                mode=self._bench_mode,
+                target_fps=self._bench_fps,
+                label=f"{self._bench_mode}@{self.cpu_governor or 'unlocked'}",
+            )
+        finally:
+            self.freq_sampler.stop()
+            self._restore_governor()
+            if self.preview_server is not None:
+                self.preview_server.shutdown()
+        # The clock histogram has to land in the SAME file as the RSS curve:
+        # stdout here is the root-owned app.log the fleet account cannot read,
+        # so anything printed and not written is evidence that does not exist.
+        result["cpufreq"] = self.freq_sampler.report()
+        result["cpufreq_before"] = self.cpufreq_before
+        result["cpufreq_after"] = cpufreq.snapshot()
+        try:
+            import json
+
+            with open(self._bench_out, "w") as fh:
+                json.dump(result, fh, indent=1)
+            os.chmod(self._bench_out, 0o644)
+        except OSError as exc:
+            print(f"[intrusion] BENCH result rewrite failed: {exc}", flush=True)
+        print(f"[intrusion] BENCH done: {result.get('rss_slope_mb_per_min')} MB/min, "
+              f"{result.get('iterations')} iterations, "
+              f"infer p50={result.get('infer_ms_p50')}ms, "
+              f"freq={result['cpufreq']}", flush=True)
+
     def run(self):
+        if self._bench:
+            self._run_bench()
+            return
         self.pub.connect()
         self._install_stop_handlers()
         deadline = (
@@ -531,6 +657,8 @@ class IntrusionDetectionApp(App):
             self.pub.shutdown()
             if self.preview_server is not None:
                 self.preview_server.shutdown()
+            self.freq_sampler.stop()
+            self._restore_governor()
             self._print_summary()
 
     def _install_stop_handlers(self):
