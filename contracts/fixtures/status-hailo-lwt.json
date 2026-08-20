@@ -1,0 +1,7 @@
+{
+  "schema": "sensecraft.status/1",
+  "timestamp": 1787229961132,
+  "session_id": "1787229961020",
+  "device_id": "rpi5-hailo8-01",
+  "online": false
+}
