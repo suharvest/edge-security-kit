@@ -25,25 +25,32 @@ coordinates, so they survive a change of resolution.
 
 Same 1280×720 H.264 source, same truth video, same assertions.
 
-| | Jetson Orin NX 16GB | Radxa Rock 5T (RK3588) | LubanCat-3 (RK3576) | reCamera Pro (RV1126B) |
-|---|---|---|---|---|
-| Accelerator | TensorRT 10.3, FP16 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 |
-| Inference p50, in pipeline | 4.16 ms | 36.2–44.5 ms | 23.9 ms | 36.6 ms (32.3 ms clock-pinned) |
-| Inference p95, in pipeline | 4.19 ms | 55.8–56.2 ms | 27.9 ms | 46.8 ms (36.3 ms clock-pinned) |
-| Full pipeline p50 | 6.99 ms | 38.1–46.3 ms | 26.2 ms | 39.7 ms (camera path) |
-| Detector CPU | 5.5% of one core | 16.4–17.9% of one core | 8.6–14.0% of one core | 27% of one core |
-| Detector RSS | 310 MB | 214 MB at start | 200 MB | — |
-| Accelerator busy | GR3D 0% in 215 of 239 1 s samples | NPU Core0 8–11%, cores 1–2 idle | NPU Core0 5–6%, Core1 idle | — |
-| Board state while measured | idle, load avg 0.00 | 8 containers, 2 above 1% CPU | idle, no containers | — |
-| Decode | NVDEC, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | none — ISP dma-buf, zero-copy |
-| Single-stream ceiling | 167 inferences/s | 31.4 inferences/s | not measured | not measured |
-| Multi-stream capacity, 720p @ 5 fps | 8 streams, one process each | 16 streams at full rate; knee between 24 and 32 | not measured | not measured |
-| Sustained fps | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) | 18.8 (compute-limited) |
+| | Jetson Orin NX 16GB | Radxa Rock 5T (RK3588) | LubanCat-3 (RK3576) | reCamera Pro (RV1126B) | Raspberry Pi 5 + Hailo-8 |
+|---|---|---|---|---|---|
+| Accelerator | TensorRT 10.3, FP16 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 | HailoRT 4.21.0, HEF int8 (PTQ) |
+| Inference p50, in pipeline | 4.16 ms | 36.2–44.5 ms | 23.9 ms | 36.6 ms (32.3 ms clock-pinned) | 9.7 ms |
+| Inference p95, in pipeline | 4.19 ms | 55.8–56.2 ms | 27.9 ms | 46.8 ms (36.3 ms clock-pinned) | 10.8 ms |
+| Full pipeline p50 | 6.99 ms | 38.1–46.3 ms | 26.2 ms | 39.7 ms (camera path) | 17.4 ms |
+| Detector CPU | 5.5% of one core | 16.4–17.9% of one core | 8.6–14.0% of one core | 27% of one core | 8.7–13.0% of one core |
+| Detector RSS | 310 MB | 214 MB at start | 200 MB | — | 127–131 MB |
+| Accelerator busy | GR3D 0% in 215 of 239 1 s samples | NPU Core0 8–11%, cores 1–2 idle | NPU Core0 5–6%, Core1 idle | — | not measured |
+| Board state while measured | idle, load avg 0.00 | 8 containers, 2 above 1% CPU | idle, no containers | — | 10 unrelated containers |
+| Decode | NVDEC, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | none — ISP dma-buf, zero-copy | ffmpeg software — the Pi 5 has no H.264 decoder |
+| Single-stream ceiling | 167 inferences/s | 31.4 inferences/s | not measured | not measured | 319 inferences/s (`hailortcli run`, idle NPU — not the pipeline apparatus) |
+| Multi-stream capacity, 720p @ 5 fps | 8 streams, derived from a 236 inf/s ceiling — no 8-stream run | 16 streams at full rate; knee between 24 and 32 | not measured | not measured | not measured |
+| Sustained fps | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) | 18.8 (compute-limited) | 5.0 (source-limited) |
 
-**The reCamera Pro column is not like-for-like.** The other three boards decode
-a replay clip at a 5 fps source rate; the camera takes ISP frames over dma-buf,
+**The reCamera Pro column is not like-for-like.** The other boards decode a
+replay clip at a 5 fps source rate; the camera takes ISP frames over dma-buf,
 decodes nothing at all, and runs compute-limited at 18.8 fps, so neither its
 pipeline figure nor its fps compares directly.
+
+**Nor is the Pi 5 column, on the pipeline row.** The Pi 5 has no H.264 decoder —
+VideoCore VII is HEVC-only — so its 17.4 ms full-pipeline p50 carries a software
+decode that the Jetson and both Rockchip boards hand to dedicated silicon. The
+inference row is comparable; the pipeline row is not, and the gap widens with
+resolution. Its `Detector CPU` figure is the same story: 8.7–13.0% of one core
+buys decode as well as inference.
 
 Its inference number is quoted twice because the shipped `interactive` governor
 makes it a moving target. Pinned measurements, ~5 min each with the frequency
@@ -257,10 +264,11 @@ The kit ships a ctypes backend that avoids the cycles entirely and is also
 faster; a periodic `gc.collect()` is the one-line alternative, at +23% inference
 p50.
 
-Multi-stream capacity is now measured on both accelerators: 8 streams on Orin
-NX, and a full 1→32 ladder on RK3588 that puts the knee between 24 and 32 with
-RGA rather than the NPU as the first thing to give out. RK3576 and reCamera Pro
-remain single-stream only.
+Multi-stream capacity is measured on one accelerator and derived on another. A
+full 1→32 ladder was run on RK3588: it puts the knee between 24 and 32, with RGA
+rather than the NPU as the first thing to give out. The Orin NX figure of 8
+streams is derived from its measured 236 inf/s ceiling and per-process cost, not
+from an 8-stream run. RK3576, reCamera Pro and Hailo remain single-stream only.
 
-Not built: Hailo. Not measured: multi-stream on RK3576 or reCamera Pro, and any
-source above 5 fps on RK3588.
+Not built: nothing. Not measured: NPU occupancy on Hailo, multi-stream on
+Hailo, RK3576 or reCamera Pro, and any source above 5 fps on RK3588.
