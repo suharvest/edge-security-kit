@@ -46,6 +46,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 import time
@@ -139,7 +140,7 @@ def print_report(title, result):
         print(f"{s['t_s']:>9.2f} {s['iterations']:>9} {s['rss_kb']:>10} "
               f"{heap:>9} {s['free_mb']:>9.1f}")
     print()
-    for key in ("iterations_measured", "rss_delta_kb", "kb_per_inference",
+    for key in ("gc_every", "iterations_measured", "rss_delta_kb", "kb_per_inference",
                 "mb_per_min", "stopped_by", "infer_ms_p50"):
         if key in result:
             print(f"{key:>22}: {result[key]}")
@@ -188,6 +189,11 @@ def main(argv=None):
                     help="inferences run before measurement starts (default 20)")
     ap.add_argument("--max-iterations", type=int, default=0,
                     help="stop after this many measured inferences (0 = no cap)")
+    ap.add_argument("--gc-every", type=int, default=0,
+                    help="run gc.collect() every N measured inferences "
+                         "(0 = never, the default). Forces Python to reclaim "
+                         "anything a reference cycle is holding, so growth that "
+                         "survives this cannot be a Python-side object pile-up.")
     ap.add_argument("--min-free-mb", type=float, default=250.0,
                     help="abort if MemAvailable drops below this (default 250)")
     ap.add_argument("--input-shape", default="",
@@ -231,6 +237,7 @@ def main(argv=None):
         "n_output": n_output,
         "warmup": args.warmup,
         "sample_every_s": args.sample_every,
+        "gc_every": args.gc_every,
     }
     print(f"model {args.model}\n  input {tuple(shape)} uint8 NHWC, "
           f"{n_input} input(s), {n_output} output(s)")
@@ -262,6 +269,10 @@ def main(argv=None):
             del outputs
 
             iterations += 1
+            # Identical placement in both scripts: after the call and after
+            # the outputs have been dropped, before any early exit.
+            if args.gc_every and iterations % args.gc_every == 0:
+                gc.collect()
             if args.max_iterations and iterations >= args.max_iterations:
                 result["stopped_by"] = "max_iterations"
                 break
