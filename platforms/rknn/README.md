@@ -237,6 +237,170 @@ the number that decides whether a detector keeps up with a stream.
 CPU goes slightly *up* on the zoo models: the DFL that left the graph landed in
 NumPy. A fair trade at 5 fps, worth re-checking at 25.
 
+## Multi-stream capacity, 2026-08-20
+
+One detector process per stream, each with its own RTSP source, on the Radxa
+Rock 5T. 1 / 2 / 4 / 6 / 8 / 16 / 24 / 32 concurrent streams, 1280×720 H.264 at
+5 fps, model C, `conf 0.35` / `iou 0.45`, `npu_core_mask: null`. Every rung is
+30 s of warmup followed by a 120 s sample of the published payloads, the same
+definitions and the same harness fields as the single-stream re-measurement
+above.
+
+**The single-stream rung reproduces the published baseline**, which is what
+makes the rest of the ladder readable: 36.76 ms infer p50 and 54.70 ms p95
+against the published 36.2–44.5 / 55.8–56.2, at 16.9 % of one core and NPU
+Core0 9.1 %.
+
+| streams | aggregate | infer p50, min–max across streams | infer p95, min–max | NPU Core0/1/2 | detector CPU, all streams | RSS per process | MemAvailable, min | streams below source rate |
+|---:|---:|---|---|---|---:|---:|---:|---:|
+| 1 | 5.00 inf/s | 36.76 | 54.70 | 9.1 / 0 / 0 % | 0.17 core | — (aged, see below) | 10 142 MB | 0 |
+| 2 | 10.00 | 33.71 – 34.73 | 50.55 – 51.40 | 18.1 / 0 / 0 % | 0.26 core | 194 MB | 10 011 MB | 0 |
+| 4 | 20.00 | 31.24 – 42.35 | 45.09 – 49.51 | 29.5 / 8.9 / 0 % | 0.50 core | 196 – 228 MB | 9 578 MB | 0 |
+| 6 | 30.00 | 24.92 – 55.47 | 36.42 – 70.54 | 38.2 / 18.6 / 11.6 % | 0.85 core | 191 – 211 MB | 9 248 MB | 0 |
+| 8 | 39.97 | 24.61 – 47.16 | 38.32 – 80.57 | 44.2 / 23.1 / 12.6 % | 1.04 core | 196 – 213 MB | 8 842 MB | 0 |
+| **16** | **80.01** | **21.51 – 33.17** | **27.40 – 46.93** | 63.8 / 40.1 / 20.8 % | 1.39 core | 173 – 220 MB | 7 332 MB | **0** |
+| 24 | 119.94 | 20.01 – 40.87 | 25.52 – 50.87 | 79.5 / 61.3 / 42.6 % | 2.01 core | 173 – 223 MB | 5 685 MB | 4, losing 1–3 frames each |
+| 32 | 156.98 | 32.86 – **99.15** | 47.95 – **121.89** | 88.3 / 83.3 / 77.2 % | 3.54 core | 177 – 226 MB | 4 070 MB | **14, one down to 4.43 fps** |
+
+Aggregate is the published-message rate summed over all streams, so a rung that
+holds source rate reads exactly 5× the stream count. Detector CPU is the sum of
+the per-process `utime+stime` deltas as a fraction of one core; the board has
+eight. The RTSP publishers that feed the streams run on the same board and scale
+with the rung, and their cost is *not* in that column — these are the detectors'
+own figures.
+
+### The three NPU cores do get used, by process
+
+This is the question `npu_core_mask` leaves open, and multi-process answers it
+the opposite way to multi-core-on-one-model. **Core1 first shows load at 4
+streams and Core2 at 6**, with no configuration change: `core_mask` stays
+`null`, the RKNN runtime places each process's context at `init_runtime`, and
+separate contexts land on separate cores.
+
+```
+1 stream    NPU load:  Core0: 10%, Core1:  0%, Core2:  0%,
+4 streams   NPU load:  Core0: 30%, Core1:  9%, Core2:  0%,
+6 streams   NPU load:  Core0: 35%, Core1: 17%, Core2: 11%,
+16 streams  NPU load:  Core0: 63%, Core1: 41%, Core2: 22%,
+32 streams  NPU load:  Core0: 88%, Core1: 83%, Core2: 76%,
+```
+
+The placement is not balanced. At 24 streams the cores read 79.5 / 61.3 /
+42.6 %, so Core0 carries close to twice Core2's share and reaches its own
+ceiling before the other two do. That asymmetry is what makes the degradation
+unfair rather than uniform, below.
+
+This does not contradict the `core_mask` finding above: `NPU_CORE_0_1_2` still
+does not split *one* inference across cores. Multi-core on this part is for
+running several contexts at once, which is exactly what one process per stream
+produces.
+
+### More streams make each stream faster, up to a point
+
+The counter-intuitive row is 16: infer p50 across all sixteen streams is
+21.5–33.2 ms, *below* the 36.76 ms the same board turns in with a single stream,
+and every p95 at 16 streams is better than the single stream's 54.70 ms.
+
+This is the weight-traffic effect the single-stream section already documents,
+seen from the other side. A lone detector at 5 fps leaves the NPU idle for
+160 ms out of every 200 and re-pays the weight traffic on every frame; sixteen
+detectors keep it busy and each inference lands cheaper. It is the same reason a
+flat-out benchmark loop reads faster than the pipeline it describes — here the
+pipeline gets the benchmark's conditions for free.
+
+So **latency alone will not tell you how loaded this board is.** Between 1 and
+24 streams it moves in the wrong direction.
+
+### Saturation is between 24 and 32 streams, and RGA breaks before the NPU does
+
+At 24 streams the board delivers 119.94 inferences/s with every stream inside
+0.4 % of source rate — four streams lost between one and three frames in 120 s.
+At 32 it delivers 156.98 against a demand of 160.26, fourteen streams lose
+frames, and one is down to 4.43 fps.
+
+The thing that fails first is **not** the NPU. Frame loss tracks the RGA 2D
+scaler, which is what letterboxes during MPP decode:
+
+```
+RgaBlit(1513) RGA_BLIT fail: Input/output error
+```
+
+Those lines are absent at 8 streams, appear twice at 16, fourteen times at 24,
+and 1 085 times at 32 — and at 32 their per-stream count predicts which streams
+drop frames:
+
+| stream | RGA_BLIT failures | published fps |
+|---|---:|---:|
+| mc-09 | 210 | 4.440 |
+| mc-25 | 204 | 4.432 |
+| mc-15 | 182 | 4.483 |
+| mc-27 | 110 | 4.734 |
+| mc-06 | 82 | 4.758 |
+| mc-24 | 78 | 4.793 |
+| mc-20 | 76 | 4.791 |
+| mc-08 | 66 | 4.832 |
+| mc-23 | 41 | 4.883 |
+| every stream with ≤ 8 failures | ≤ 8 | 5.008 |
+
+The NPU is the *second* limit and it shows up as latency rather than as loss:
+three cores at 88.3 / 83.3 / 77.2 % — 249 of a possible 300 — and infer p50
+spread from 32.86 ms to 99.15 ms across the 32 streams.
+
+Nothing else is close to its limit at 32 streams. CPU is 3.54 of eight cores.
+MemAvailable is still 4 070 MB. The NPU held 1.0 GHz throughout and
+`npu-thermal` peaked at 73.0 °C, so no rung was throttled.
+
+**Decode is not the bottleneck; decode-time *scaling* is.** All 32 streams
+negotiated `mppvideodec` and RGB 640×360 and none fell back to the CPU decoder —
+`require_hw_decode: true` would have refused to start if one had — and no
+`fallback_active` appears in any log at any rung. What runs out is RGA, the
+separate 2D block that MPP hands each decoded frame to.
+
+### Degradation is unfair, not uniform
+
+Past saturation the streams do not slow down together. At 32 streams three of
+them sit at 33 ms p50 and full 5.008 fps while another sits at 99 ms, and the
+frame-losing streams are a fixed set rather than a rolling sample. Inter-message
+gap p95 stays near 240 ms on the healthy streams and reaches 408 ms — two whole
+frame periods — on the starved ones.
+
+The cause is the static placement above: a context assigned at `init_runtime`
+stays on its core, so which stream suffers is decided when its process starts
+rather than by what it is doing. **A monitoring rule that watches the mean
+across streams will not see this.** Watch the worst stream's `pipeline_ms` and
+its published rate.
+
+### What to plan for
+
+**16 streams of 720p at 5 fps is the number to quote for an RK3588 board**:
+every stream inside 0.05 % of source rate, worst p95 46.9 ms, the NPU at 41 % of
+its three-core capacity and 1.4 of eight CPU cores in use, with 7.3 GB of RAM
+still free. 24 work with the caveat of a handful of dropped frames. 32 is past
+the knee.
+
+One caveat outweighs the throughput numbers for anything long-lived. Per-process
+RSS is 173–226 MB *fresh*, and that is what the table reports — but the rknnlite
+reference cycles documented above mean a process keeps growing: the detector in
+these runs that had been up for two days measured 1 839 MB in every rung
+alongside the fresh ones. Sixteen processes at that size do not fit in 16 GB.
+**A multi-stream deployment has to run the ctypes backend or a periodic
+`gc.collect()`**, or the capacity in this table is a first-hour capacity.
+
+### How this was measured, and what it does not control
+
+Sources are independent: one `mediamtx` path and one `ffmpeg -c copy` publisher
+per stream on the board itself, all replaying the same truth clip, so no
+re-encode sits between the fixture and the decoder and no stream shares a
+decoder session with another.
+
+Conditions are **as-found**, and identical across rungs in the way that matters:
+the board's eight unrelated co-tenant containers ran throughout, and one of the
+detectors in every rung is the board's own long-running deployment rather than a
+process started for the test. Two things are not controlled — the number of RTSP
+publisher containers grows with the rung, and each rung is a single 120 s window
+with no repeat, so the ladder carries no spread while this board's single-stream
+p50 is known to move 8 ms between windows.
+
 ### End to end, against the truth video
 
 `tools/rtsp-fixture/verify_e2e.py`, fixture clip, 130 s, each model in turn on

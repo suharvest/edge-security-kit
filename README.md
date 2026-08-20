@@ -37,6 +37,7 @@ Same 1280×720 H.264 source, same truth video, same assertions.
 | Board state while measured | idle, load avg 0.00 | 8 containers, 2 above 1% CPU | idle, no containers | — |
 | Decode | NVDEC, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | none — ISP dma-buf, zero-copy |
 | Single-stream ceiling | 167 inferences/s | 31.4 inferences/s | not measured | not measured |
+| Multi-stream capacity, 720p @ 5 fps | 8 streams, one process each | 16 streams at full rate; knee between 24 and 32 | not measured | not measured |
 | Sustained fps | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) | 18.8 (compute-limited) |
 
 **The reCamera Pro column is not like-for-like.** The other three boards decode
@@ -138,6 +139,35 @@ code up to 8 streams. Beyond that, dynamic batching, then DeepStream. The CPU
 cost at 8×1080p@15fps and NVDEC's session ceiling are extrapolated — **needs
 verifying**.
 
+Multi-stream on RK3588, measured to 32 streams on 2026-08-20: **16 streams of
+720p at 5 fps run at full source rate** — worst p95 46.9 ms, NPU at 41% of its
+three-core capacity, 1.4 of eight CPU cores, 7.3 GB of RAM free. 24 streams
+still deliver 119.9 inferences/s with four streams losing one to three frames in
+120 s; at 32 the board delivers 157 of a demanded 160, fourteen streams lose
+frames and inference p50 spreads from 33 to 99 ms.
+
+Three things about that ladder are worth carrying into a hardware choice:
+
+* **One process per stream does use all three NPU cores.** Core1 lights up at 4
+  streams and Core2 at 6, with `npu_core_mask` left `null` — the runtime places
+  each process's context on a core at `init_runtime`. It places them unevenly:
+  at 24 streams the cores read 79.5 / 61.3 / 42.6 %.
+* **RGA gives out before the NPU does.** The frame loss at 32 streams is
+  `RGA_BLIT fail` in the decode-time scaler, not NPU saturation — the failure
+  count per stream predicts which streams drop frames, and the NPU's effect is
+  latency rather than loss. Hardware decode itself never fell back: all 32
+  streams ran on `mppvideodec`.
+* **More streams make each stream faster, up to 24.** At 16 streams every
+  stream's p50 and p95 beat the single-stream figures, because a lone detector
+  at 5 fps re-pays weight traffic that a busy NPU amortizes. Latency is
+  therefore not a load indicator on this board.
+
+The binding constraint for a real deployment is memory, not throughput. Fresh
+processes hold 173–226 MB, but the rknnlite reference cycles make a process grow
+— the two-day-old detector in these runs measured 1 839 MB. Sixteen of those do
+not fit in 16 GB, so multi-stream on RK3588 requires the ctypes backend or a
+periodic `gc.collect()`.
+
 int8 on RK3588 costs 0.52 AP@.5:.95 against fp16 on 500 COCO person images
 (0.61 on small targets) and returns 37% of the inference latency. Its failure
 mode is extra low-confidence boxes rather than missed people, so raise the
@@ -227,4 +257,10 @@ The kit ships a ctypes backend that avoids the cycles entirely and is also
 faster; a periodic `gc.collect()` is the one-line alternative, at +23% inference
 p50.
 
-Not built: Hailo. Not measured: anything above two concurrent streams.
+Multi-stream capacity is now measured on both accelerators: 8 streams on Orin
+NX, and a full 1→32 ladder on RK3588 that puts the knee between 24 and 32 with
+RGA rather than the NPU as the first thing to give out. RK3576 and reCamera Pro
+remain single-stream only.
+
+Not built: Hailo. Not measured: multi-stream on RK3576 or reCamera Pro, and any
+source above 5 fps on RK3588.
