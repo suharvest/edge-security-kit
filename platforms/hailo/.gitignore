@@ -1,0 +1,10 @@
+# The HEF is ~4.2 MB and rebuilt by models/README.md's documented flow.
+models/*.hef
+# Local deployment config; config.example.yaml is the tracked template.
+config.yaml
+.venv/
+# Evidence frames written by --annotate during a run. The two committed ones
+# are named explicitly so a stray run cannot overwrite the tracked evidence.
+evidence-*.jpg
+!evidence-emulated-truth-720p.jpg
+!evidence-emulated-adl-720p.jpg

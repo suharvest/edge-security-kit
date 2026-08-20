@@ -1,0 +1,38 @@
+# Raspberry Pi 5 + Hailo-8 / 8L detector configuration. Copy to config.yaml.
+device_id: rpi5-hailo8-01
+stream_id: cam-0
+
+# RTSP URL. Use a non-square source: a square one passes even when the
+# letterbox inverse is missing entirely.
+source: rtsp://127.0.0.1:8557/edge-sec-truth
+rtsp_transport: tcp
+
+# The Raspberry Pi 5 has no H.264 hardware decoder (VideoCore VII decodes HEVC
+# only), so FFmpeg runs on the CPU. "sw" is this platform's primary path, not a
+# fallback: health.decode reports sw and health.fallback_active stays false.
+# There is no require_hw_decode switch here for the same reason -- unlike the
+# Rockchip platform, there is no hardware path to be silently dropped from.
+decode_primary: sw
+
+# Built by models/build_hef.py from the same yolov8n.onnx every other platform
+# runs. See models/README.md for the hash and the toolchain versions.
+model: models/yolov8n.hef
+input_size: 640
+conf_threshold: 0.35
+iou_threshold: 0.45
+infer_timeout_ms: 5000
+
+track_iou_threshold: 0.2
+track_max_lost_s: 0.75
+
+mqtt_host: 127.0.0.1
+mqtt_port: 1883
+topic_prefix: sensecraft/security
+status_interval_s: 30
+
+preview_enabled: true
+preview_bind: 0.0.0.0
+preview_port: 8099
+# Address a browser can actually reach. Left empty, preview_url and live_url
+# are omitted rather than advertised wrongly.
+preview_advertise_host: ""
