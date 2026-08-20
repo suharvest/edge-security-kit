@@ -1,0 +1,34 @@
+{
+  "schema": "sensecraft.detection/1",
+  "timestamp": 1787230204824,
+  "session_id": "1787229961020",
+  "frame_id": 1215,
+  "device_id": "rpi5-hailo8-01",
+  "stream_id": "cam-0",
+  "coordinate_space": "frame_norm",
+  "frame": {
+    "w": 1280,
+    "h": 720
+  },
+  "inference_time_ms": 9.694,
+  "pipeline_ms": 15.538,
+  "detections": [
+    {
+      "track_id": 1,
+      "class": "person",
+      "score": 0.9216,
+      "bbox": [
+        0.201392,
+        0.536143,
+        0.216003,
+        0.919895
+      ]
+    }
+  ],
+  "health": {
+    "fps": 5.0,
+    "decode": "sw",
+    "backend": "hailort-4.21.0-hailo",
+    "fallback_active": false
+  }
+}

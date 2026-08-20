@@ -5,8 +5,8 @@ MQTT. Same contract, same tracker, same `frame_norm` publishing path as
 `platforms/generic` and `platforms/rknn`; the platform-specific parts are the
 HEF build and the head decode.
 
-**Status: compiled and unit-tested, not yet run on the NPU.** Read
-"Not yet verified on hardware" before quoting anything from here as a result.
+**Status: measured on the reference board.** See "Measured on a Raspberry Pi 5
++ Hailo-8" below; every number there came off that run.
 
 ## What is platform-specific
 
@@ -103,22 +103,25 @@ squashed or offset rectangles instead of as a plausible number.
 Host-only, no NPU and no HEF needed:
 
 ```bash
-uv run pytest        # 25 passed, 4 skipped
+uv run pytest        # 37 passed
 ```
 
 `test_decode_head.py` plants one-hot DFL distributions into a synthetic head,
 so the expected box is analytic and the test does not re-implement the softmax
 it is checking. It pins branch pairing, stride derivation, the DFL sign
 convention, output-order independence and the letterbox inverse on a 16:9
-source. `test_fixtures_schema.py` skips while `fixtures/` is empty — see below.
+source. `test_fixtures_schema.py` validated 3 captured payloads from the
+hardware run; it skipped, and the count was 25 passed / 4 skipped, until
+`fixtures/` was populated on 2026-08-20.
 
-## Correctness evidence so far
+## Correctness evidence before the hardware run
 
 The quantized graph was run in the Dataflow Compiler's emulator against real
 1280×720 frames and decoded by the committed `esk_hailo` code. This exercises
 the head decode, the letterbox inverse and the `frame_norm` conversion with the
 exact weights baked into the HEF. **It is not a hardware run and says nothing
-about latency.**
+about latency**; it is kept because it is what the geometry was checked against
+before the NPU was available, and the board run below agrees with it.
 
 ![emulated detection on the truth clip](evidence-emulated-truth-720p.jpg)
 
@@ -135,42 +138,144 @@ published centres land 0.7 px and 1.8 px from it, and the box height (0.921 of
 letterbox pads 140 px top and bottom; an inverse that ignored the pad or
 divided x and y by different factors could not produce those numbers.
 
-## Not yet verified on hardware
+## Measured on a Raspberry Pi 5 + Hailo-8 (HailoRT 4.21.0, 1280×720 H.264 @ 5 fps)
 
-Every claim above about latency, throughput, CPU, NPU occupancy and end-to-end
-rule behaviour is **absent, not pending publication**. No inference has run on
-the NPU.
+Raspberry Pi OS, kernel 16 KB pages, `hailo_pci force_desc_page_size=4096`,
+`hailort` and `hailort-pcie-driver` both 4.21.0 and `apt-mark hold`ed, firmware
+4.21.0 on a Hailo-8 at `0001:01:00.0`. Broker, hub, RTSP server and detector all
+on the board, so network jitter cannot be read as detector latency. The board was
+*not* quiesced: ten unrelated containers kept running throughout and only the one
+holding `/dev/hailo0` was stopped for the duration.
 
-The reason is not a code or toolchain problem. On the reference board the
-Hailo-8 is held exclusively by an unrelated long-running service; HailoRT hands
-a `VDevice` to one process at a time unless every participant goes through the
-multi-process service, which the incumbent does not:
+The HEF is the artifact `models/README.md` pins — `sha256 dbabd55f…e501475`,
+verified on the board after transfer.
+
+### The device is reachable, and `fw-control identify` is not the check
+
+With the incumbent stopped, `hailortcli run` is the check that settles it:
 
 ```
-$ hailortcli run models/yolov8n.hef -t 3
-[HailoRT] [error] CHECK failed - Failed to create vdevice. there are not
-enough free devices. requested: 1, found: 0
-[HailoRT CLI] [error] CHECK_SUCCESS failed with status=
-HAILO_OUT_OF_PHYSICAL_DEVICES(74) - Failed creating vdevice
+$ hailortcli run models/yolov8n.hef -t 5
+Running streaming inference (models/yolov8n.hef):
+  Transform data: true
+    Type:      auto
+    Quantized: true
+> Inference result:
+ Network group: yolov8n
+    Frames count: 1597
+    FPS: 319.01
+    Send Rate: 3136.01 Mbit/s
+    Recv Rate: 3087.01 Mbit/s
 ```
 
-`hailortcli fw-control identify` still succeeds against an occupied device — it
-opens a control handle, not a `VDevice` — so it is not a usable check for
-"the NPU is free". The device-level check is the `run` above, or any
-`VDevice()` construction.
+319 fps back-to-back on an otherwise idle NPU. That is a benchmark loop, not a
+per-frame cost in this pipeline — see the latency table below, where the same
+inference call takes 9.7 ms (103 fps equivalent) at 5 fps.
 
-What is still owed before this platform belongs in the top-level `Measured`
-table:
+`--validate` reports the shapes the decoder expects, from the real device:
 
-- captured MQTT fixtures in `fixtures/` (detection, status, status-LWT) and the
-  promotion into `contracts/fixtures/`;
-- the ground-truth harness pass (`tools/rtsp-fixture/verify_e2e.py`) against
-  `truth.json`: line-cross instants and direction, the forward-only line not
-  firing on the backward traverse, zone entry, loitering dwell, real snapshots;
-- in-pipeline inference p50/p95, pipeline p50, sustained fps, detector CPU and
-  RSS, and NPU occupancy from `hailortcli monitor`;
-- an annotated evidence frame produced by `--annotate` on the board rather than
-  by the emulator.
+```
+model OK: .../models/yolov8n.hef backend=hailort-4.21.0-hailo
+input yolov8n/input_layer1 (640, 640, 3)
+output yolov8n/conv41 (80, 80, 64)
+output yolov8n/conv42 (80, 80, 80)
+output yolov8n/conv52 (40, 40, 64)
+output yolov8n/conv53 (40, 40, 80)
+output yolov8n/conv62 (20, 20, 64)
+output yolov8n/conv63 (20, 20, 80)
+```
 
-Freeing the device means stopping the process that holds it, which was out of
-scope for the run that produced this platform.
+### Latency, CPU and memory
+
+Three windows on the running stack — the 130 s acceptance run, a 40 s
+`--annotate` run and a 30 s run:
+
+| | 130 s run | 40 s run | 30 s run |
+|---|---:|---:|---:|
+| `inference_time_ms` p50 / p95 | 9.7 / 10.8 | 9.81 / 10.74 | 9.68 / 10.91 |
+| `pipeline_ms` p50 / p95 | 17.4 / 19.2 | 16.07 / 19.71 | 15.79 / 19.40 |
+| sustained fps | 5.00 (source-limited) | 5.00 | 5.00 |
+
+`pipeline_ms` starts after `capture.read()`, the same point `platforms/rknn`
+measures from, so the two are comparable and neither includes RTSP decode.
+
+Detector CPU sampled from `/proc/<pid>/stat` deltas over 60 s, one core:
+**8.7 – 13.0 %, median 11.7 %**. RSS **127 – 131 MB**.
+
+A note for anyone re-measuring RSS on this board: the kernel runs 16 KB pages, so
+`statm` resident must be multiplied by 16384, not 4096. Assuming 4 KB reports
+32 MB — a quarter of the truth — and `ps rss` (131040 kB) is what settles it.
+
+NPU occupancy was not sampled: `hailortcli monitor` needs
+`HAILO_MONITOR=1` exported in the *measured* process before it starts, and the
+run was not launched with it. Absent, not estimated.
+
+### End to end, against the truth video
+
+`tools/rtsp-fixture/verify_e2e.py`, 130 s, `ESK_SKIP_ADL=1`, hub and broker on
+the board, truth clip published at 5 fps on `rtsp://127.0.0.1:8557/edge-sec-truth`:
+
+```
+== FAILURES
+  FAIL zone_enter alert 1 (track 1): no truth entry within 0.5s (nearest -30.800s)
+```
+
+| assertion | tolerance | measured |
+|---|---|---|
+| `line_cross` forward instants (×4) | ±0.5 s | 0.0062 – 0.0064 s |
+| `line_cross` backward instants (×4) | ±0.5 s | 0.1831 – 0.1888 s |
+| direction correctness | 8/8 | 8/8 |
+| forward-only line fired on a backward crossing | never | **NONE** |
+| backward-only line fired on a forward crossing | never | **NONE** |
+| `zone_enter` instants (×4) | ±0.5 s | 0.001 s |
+| `loitering` dwell error | ≤1 s | 0.004 – 0.2 s |
+| snapshots | real JPEG | 8/8, `image/jpeg`, 50.4 – 52.7 KB |
+
+Capture-to-alert p50 **23.8 ms**, p95 **206.2 ms**.
+
+The one complaint is alert `1`: a `zone_enter` fired at rule install, because the
+subject was already inside the zone when the rules were PUT and the first frame
+the hub judged was therefore an entry. Its nearest truth instant is 30.8 s away —
+one clip period — so it is the leading artefact the RK3588, RK3576 and Jetson
+READMEs describe, not a coordinate or timing error. Every one of the 32 alerts
+that follows it pairs with a truth instant. The line was left at `x = 0.5`
+(no `ESK_LINE_X` nudge): decode is software at full 1280×720 here, so a published
+`cx` is not quantized to the 1/640 grid that puts a mid-frame line on `side == 0`
+for the RK platforms.
+
+### Evidence frame
+
+![annotated detection on the board](fixtures/rpi5-hailo8-evidence-annotated.jpg)
+
+Drawn from the published `frame_norm` values on the board, not by the emulator.
+The box height (0.9199 of 720 px = 662 px) matches the 662 px person patch, which
+a letterbox inverse that ignored the 140 px pad could not produce.
+
+### Captured payloads
+
+`fixtures/` now holds detection, status and status-LWT taken off the broker
+during this run; `tests/test_fixtures_schema.py` no longer skips.
+
+```
+$ .venv/bin/python -m pytest -q
+37 passed in 0.52s
+```
+
+### One defect found: the process segfaults on exit
+
+Every mode exits with **139** — `--validate`, `--seconds N`, the annotate run —
+after printing its full result and after all work is done:
+
+```
+2026-08-20 20:53:06,721 INFO esk.hailo published 142 detection messages, 5.00 fps,
+  inference p50=9.68ms p95=10.91ms, pipeline p50=15.79ms p95=19.40ms
+Segmentation fault
+run rc=139
+```
+
+No payload, measurement or file is affected — the crash is in HailoRT teardown at
+interpreter exit, past the last publish. It matters anyway: a supervisor
+(systemd, Docker restart policy) reads 139 as a crash, so a clean shutdown is
+indistinguishable from a failure, and `contracts/MQTT.md`'s clean-exit path (a
+retained `online: false` written on DISCONNECT rather than via the LWT) cannot be
+relied on. Not fixed here; the VDevice teardown ordering is where to look.
