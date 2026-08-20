@@ -1,19 +1,29 @@
-# rknn_toolkit_lite2 per-inference leak — standalone reproduction
+# rknn_toolkit_lite2 per-inference memory growth — standalone reproduction
 
 Two scripts. Each is self-contained: no imports from this repository, no build
 step, no packaging. Copy either one onto an RKNPU board and run it.
 
 | file | what it does | dependencies |
 |---|---|---|
-| `leak_repro.py` | the leak, through `rknnlite.api.RKNNLite` | `numpy`, `rknn_toolkit_lite2` |
+| `leak_repro.py` | the growth, through `rknnlite.api.RKNNLite`, with `--gc-every N` as the intervention | `numpy`, `rknn_toolkit_lite2` |
 | `ctypes_control.py` | the same API sequence with `rknn_toolkit_lite2` removed from the call path, plus a positive control | `numpy`, `ctypes` (stdlib) |
+
+What the scripts establish:
 
 `leak_repro.py` shows RSS climbing tens of kB per `inference()` call and never
 levelling off. `ctypes_control.py` runs `rknn_inputs_set` / `rknn_run` /
 `rknn_outputs_get` / `rknn_outputs_release` straight against `librknnrt.so` —
-the sequence the closed Cython extension performs — and stays flat. That pair
-places the missing `free` inside `rknn_runtime.cpython-*-aarch64-linux-gnu.so`
-rather than in `librknnrt` or in the caller.
+the sequence the closed Cython extension performs — and stays flat, so
+`librknnrt` itself is clean and the growth is introduced by the
+`rknn_toolkit_lite2` wrapper.
+
+`leak_repro.py --gc-every 5` then shows the growth collapsing by 269× (42.4321
+→ 0.1578 kB/inference) with RSS oscillating instead of trending. Memory that
+comes back when `gc.collect()` is called is not lost: **`RKNNLite.inference()`
+leaves one set of reference cycles per call, holding that call's ctypes
+buffers.** Reference cycles are invisible to refcounting; only the cyclic
+collector breaks them. This is not a C-level `malloc` without a matching
+`free`.
 
 Both scripts use the same warmup, the same sampling interval and the same
 kB-per-inference arithmetic, so their numbers are directly comparable. That is
@@ -51,15 +61,18 @@ platforms/rknn/models/yolov8n_zoo_int8.rk3576.rknn
 platforms/recamera-pro/models/yolov8n_zoo_int8.rv1126b.rknn
 ```
 
-The leak is not specific to this graph: the same rate was measured through the
+The growth is not specific to this graph: the same rate was measured through the
 same wrapper with a yolo11n-pose head, which returns a different number of
 output tensors of different shapes.
 
 ## Running
 
 ```bash
-# the leak
+# the growth
 python3 leak_repro.py --model yolov8n.rknn --seconds 300 --sample-every 30
+
+# the intervention — same run with periodic gc.collect()
+python3 leak_repro.py --model yolov8n.rknn --seconds 300 --sample-every 30 --gc-every 5
 
 # the control — same sequence, rknn_toolkit_lite2 out of the path
 python3 ctypes_control.py --model yolov8n.rknn --seconds 300 --sample-every 30
@@ -72,6 +85,41 @@ Useful flags (both scripts): `--warmup N` (default 20, excluded from the
 statistics), `--max-iterations N`, `--min-free-mb MB` (default 250),
 `--json out.json`. `ctypes_control.py` also takes `--lib` if `librknnrt.so` is
 not at `/usr/lib/librknnrt.so`.
+
+### `--gc-every N` is the verdict, not a tuning knob
+
+`leak_repro.py --gc-every N` calls `gc.collect()` after every N measured
+inferences, in the same place in the loop as the sampler, so the two runs stay
+comparable. It is what separates a real leak from cyclic garbage:
+
+| with `--gc-every 5` | reading |
+|---|---|
+| rate drops to the same order as the ctypes control, RSS oscillates without trend | cyclic garbage — memory the collector reclaims, not memory that was lost |
+| rate essentially unchanged | a real leak, outside the reach of the collector |
+
+Run both, back to back, on the same board and model:
+
+```bash
+python3 leak_repro.py --model m.rknn --seconds 300 --sample-every 30
+python3 leak_repro.py --model m.rknn --seconds 300 --sample-every 30 --gc-every 5
+```
+
+N between 1 and 10 is enough to make the difference obvious; smaller N costs
+more latency (`--gc-every 5` moved p50 from 19.8 ms to 24.3 ms on RK3588) and
+does not change the verdict. Watch `infer_ms_p50` in both runs — the gc cost
+shows up there, and if you are considering periodic `gc.collect()` as the
+production mitigation, that number is the price.
+
+### Minimum credible sample
+
+At least **3000 inferences or 180 s**, whichever comes later, with
+`--sample-every` no larger than 30 s so the per-interval slope is visible.
+
+The first interval of any run is dominated by start-up allocation: model load,
+glibc arena growth, the first-touch of the output buffers. A 30-inference
+reading is almost entirely that, and it will report a per-inference rate that
+neither reproduces nor scales. Only a rate whose per-interval slope stays
+roughly constant across at least four intervals means anything.
 
 ### `--omit-release` is capped on purpose
 
@@ -119,7 +167,7 @@ Two ways to get a process that can open it:
 2. **Run it as an appmgr app.** `appmgr` starts apps as root, so a script
    invoked from an app's entry point inherits the access. This is the heavier
    route — the package has to be signed with an ECDSA-P256 key the device
-   trusts — and it is only worth it if you need the leak measured inside a
+   trusts — and it is only worth it if you need the growth measured inside a
    real app process rather than standalone.
 
 Other RKNPU boards differ. On RK3588 (Radxa, kernel 6.1 BSP) the NPU is reached
@@ -133,9 +181,11 @@ Each script prints one row per sample and then the summary:
 
 - `kb_per_inference` — the number that matters. Computed from the first to the
   last post-warmup sample: `ΔVmRSS / Δiterations`.
-- `heap_MB` — size of the anonymous `[heap]` VMA. It tracking `rss_kb` is what
-  identifies the growth as unfreed `malloc` rather than new mappings or
-  file-backed pages.
+- `heap_MB` — size of the anonymous `[heap]` VMA. It tracking `rss_kb` places
+  the growth on the heap rather than in new mappings or file-backed pages. It
+  does **not** distinguish unfreed `malloc` from cyclic garbage: the ctypes
+  buffers held by the cycles are heap allocations too. Only `--gc-every`
+  separates those two.
 - `free_MB` — `MemAvailable`, what the abort guard watches. `MemFree` would be
   the wrong input: most of what these boards hold is reclaimable page cache.
 - `stopped_by` — `max_iterations` or `min_free_mb` if a guard fired.
@@ -144,9 +194,15 @@ Interpretation:
 
 | `kb_per_inference` | reading |
 |---|---|
-| tens of kB, not decaying across samples | the leak |
+| tens of kB, not decaying across samples | accumulation rate of memory not yet reclaimed by the collector — re-run with `--gc-every 5` to find out whether it is cyclic garbage or a real leak |
 | under ~0.1 | flat; the residual is glibc arena settling, and it stops |
 | thousands | the positive control, or something much worse |
+
+The number by itself is a growth rate, not a leak. `leak_repro.py` at
+42 kB/inference and `leak_repro.py --gc-every 5` at 0.16 kB/inference are the
+same code doing the same work; the difference is whether the cyclic collector
+got to run. Read row 1 as "not reclaimed yet", and use `--gc-every` to decide
+which kind it is.
 
 A single sample interval is not enough. Growth over the first interval alone is
 dominated by arena settling; run at least 300 s and check that the per-interval
@@ -159,7 +215,7 @@ rknn_toolkit_lite2 2.3.2, `librknnrt` 2.3.2 (429f97ae6b@2025-04-09), NPU driver
 0.9.8, `yolov8n_zoo_int8.rk3588.rknn`. Informational `I RKNN:` banner lines are
 elided.
 
-### 1. `leak_repro.py` — the leak
+### 1. `leak_repro.py` — the growth
 
 ```
 $ python3 leak_repro.py --model yolov8n_zoo_int8.rk3588.rknn --seconds 300 --sample-every 30
@@ -254,12 +310,26 @@ after 40 iterations (`stopped_by: max_iterations`), 0.81 s in, having spent
 
 This is the row that makes rows 1 and 2 readable. The harness detects a
 4.6 MB/iteration leak in under a second, so the 0.054 kB/inference in run 2 is
-a real flat line and not a blind sampler. It also separates the leak from a
-missing `release`: run 1 leaks 42 kB/inference, which is 1/110th of what an
-actually-missing `release` costs — so whatever `rknnlite` fails to free, it is
-not the output buffers.
+a real flat line and not a blind sampler. It also separates run 1 from a missing
+`release`: run 1 grows 42 kB/inference, 1/110th of what an actually-missing
+`release` costs — so what accumulates through `rknnlite` is not the output
+buffers.
 
-## Two misreadings the scripts are built to rule out
+### 4. `leak_repro.py --gc-every 5` — the intervention
+
+Same board, same model, same sampler, one added `gc.collect()` every fifth
+measured inference:
+
+| run | iterations | kb_per_inference | RSS | infer_ms_p50 |
+|---|---:|---:|---|---:|
+| `leak_repro.py` | 13 690 | 42.4321 | 80.6 → 661.5 MB, monotonic | 19.8 |
+| `leak_repro.py --gc-every 5` | 9 733 | 0.1578 | sawtooth between 65 and 87 MB, no trend | 24.3 |
+
+269× lower, the same order as the ctypes control's 0.0542. The RSS curve stops
+trending and starts oscillating — memory is being handed back, so it was never
+lost. The gc costs 23% on inference latency.
+
+## Three readings the scripts separate
 
 **"You forgot to release the outputs."** `RKNNLite.inference()` owns the entire
 output path — it calls `set_inputs`, `run`, `get_outputs` on the Cython runtime
@@ -274,6 +344,33 @@ also disagree: an unreleased output set costs 4.6 MB per call (run 3), not
 each name appears once as a call — and the measured loop body contains one RKNN
 call and nothing else. The input array is allocated once outside the loop and
 never rewritten; the returned list is `del`'d immediately.
+
+**Reference cycles — this is what it actually is.** `--gc-every 5` drops the
+rate 269×, and a diagnostic that calls `gc.collect()` after every 100
+inferences returns RSS to **exactly 64632 kB** on all five collections,
+reclaiming a fixed ~198 objects each time. With `gc.DEBUG_SAVEALL` after 20
+inferences the cycles hold one `c_char_Array_1228800` (the 640x640x3 input
+copy) per inference, one ctypes array per output tensor per inference, and 198
+`RKNNRtTensorAttr`. The cycles are created inside `RKNNLite.inference()`, one
+set per call.
+
+This also explains why `del outputs` in the loop changes nothing: the same
+diagnostic reports **`numpy bytes held in cycles: 0`**. What the cycles hold
+are the ctypes buffers behind the conversion, not the numpy arrays handed back
+to the caller. Dropping the caller's reference cannot reach them — only the
+cyclic collector can.
+
+## Mitigations
+
+Two, with different trade-offs:
+
+- **Periodic `gc.collect()`** in the caller's loop. One line, no dependency on
+  library internals, costs ~23% inference latency at `--gc-every 5` (larger N
+  costs less; check with the flag on your own graph).
+- **Bypass the wrapper**: drive `librknnrt.so` over ctypes, as
+  `ctypes_control.py` does. No gc needed, and inference latency is slightly
+  lower (21.2 ms p50 vs 23.4 ms), at the cost of maintaining the bindings and
+  a numerical-equivalence test against the wrapper's output.
 
 ## Note on the RV1126B numbers
 
