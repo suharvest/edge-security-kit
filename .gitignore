@@ -7,3 +7,4 @@ data/
 snapshots/
 node_modules/
 web/screenshots/
+.DS_Store

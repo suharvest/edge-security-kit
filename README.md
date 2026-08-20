@@ -201,30 +201,30 @@ with no failures, and broker, hub and detector all run on the camera. It takes
 ISP frames over dma-buf and letterboxes on RGA, so on the camera path it decodes
 nothing — that halved per-frame CPU time, from 85.8 ms to 44.9 ms.
 
-Two caveats stay attached. It carries no accuracy sweep. And it leaks
-**43.8 kB per inference**, localized but not fixed.
+Two caveats stay attached. It carries no accuracy sweep. And the RSS growth
+that shows up on the rknnlite path — 42.4 kB per inference — needed a correction
+to what we first published about it.
 
-A bare loop settles what that is: one pre-allocated input, no frame source, RGA,
-tracker, MQTT or JPEG. 15 842 inferences grew RSS by 544 MB; the same loop with
-the inference call removed ran 273 149 iterations and moved RSS by **zero**. So
-it is the `infer()` call, and it is a small constant allocation per `rknn_run`
-rather than a leaked output buffer — the nine dequantized tensors are ~4.9 MB,
-three orders of magnitude off. It is not output-shape specific either: the pose
-model leaks the same way on the same wrapper.
+It is **cyclic garbage, not a C-level leak**. Each `RKNNLite.inference()` call
+leaves a reference cycle holding that call's ctypes buffers; refcounting cannot
+free a cycle, so RSS climbs until the automatic collector catches up. The cycles
+are built inside `rknn_runtime.cpython-311-*.so` — Cython-compiled, reaching
+`librknnrt` through ctypes — so a `del` on the caller's side does nothing.
 
-The path is `kit.runtime.engine.RknnModel.infer` → `rknnlite.api.RKNNLite.inference`
-→ `rknn_runtime.cpython-311-aarch64-linux-gnu.so` → `librknnrt.so`, and that
-last library imports both `rknn_outputs_get` and `rknn_outputs_release`. Which
-side drops the `free` needs the call counts, and gdb from an unprivileged
-account cannot attach to the root process (`ptrace: Operation not permitted`)
-while the image ships no compiler for an `LD_PRELOAD` interposer. That is the
-next step, and it is also the shape of the fix: own the get/release pairing
-through ctypes, or move to the pre-allocated `rknn_set_io_mem` path.
+The decisive measurement is an intervention, not an observation: an explicit
+`gc.collect()` every 5 inferences takes the rate from 42.43 to **0.158 kB per
+inference**, and a manual collect every 100 inferences returns RSS to exactly
+64 632 kB five times running. `librknnrt` itself is clean — driving the same API
+sequence through ctypes gives 0.054 kB per inference over 14 551 iterations.
 
-At 18.8 fps this is ~50 MB/min, so treat long-running camera deployments as
-unproven until it is settled. The vendor SDK's own `rc_infer.cpp` is *not*
-implicated — `librecamera_ext.so` exports only `rc_ext_*` frame and probe entry
-points, no `rknn_*` symbols at all, so its pre-allocated zero-copy path is not
-the one being called.
+Our earlier reading of this as a missing `free` came from observations —
+tracked-object counts flat, mapping count unchanged, growth all in anonymous
+`[heap]` — that are all true of cyclic garbage as well. See
+`docs/rknn-leak-postmortem.md`, and `tools/rknn-leak-repro/` for scripts that
+reproduce both readings on any RKNPU board.
+
+The kit ships a ctypes backend that avoids the cycles entirely and is also
+faster; a periodic `gc.collect()` is the one-line alternative, at +23% inference
+p50.
 
 Not built: Hailo. Not measured: anything above two concurrent streams.
