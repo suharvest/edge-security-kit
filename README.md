@@ -28,15 +28,15 @@ Same 1280×720 H.264 source, same truth video, same assertions.
 | | Jetson Orin NX 16GB | Radxa Rock 5T (RK3588) | LubanCat-3 (RK3576) | reCamera Pro (RV1126B) | Raspberry Pi 5 + Hailo-8 |
 |---|---|---|---|---|---|
 | Accelerator | TensorRT 10.3, FP16 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 | RKNN 2.3.2, int8 | HailoRT 4.21.0, HEF int8 (PTQ) |
-| Inference p50, in pipeline | 4.16 ms | 36.2–44.5 ms | 23.9 ms | 36.6 ms (32.3 ms clock-pinned) | 9.7 ms |
-| Inference p95, in pipeline | 4.19 ms | 55.8–56.2 ms | 27.9 ms | 46.8 ms (36.3 ms clock-pinned) | 10.8 ms |
-| Full pipeline p50 | 6.99 ms | 38.1–46.3 ms | 26.2 ms | 39.7 ms (camera path) | 17.4 ms |
+| Inference p50, in pipeline | 4.16 ms | 36.2–44.5 ms | 23.9 ms | 36.6 ms (32.3 ms clock-pinned) | 7.7 ms † |
+| Inference p95, in pipeline | 4.19 ms | 55.8–56.2 ms | 27.9 ms | 46.8 ms (36.3 ms clock-pinned) | 8.4 ms † |
+| Full pipeline p50 | 6.99 ms | 38.1–46.3 ms | 26.2 ms | 39.7 ms (camera path) | 9.5 ms |
 | Detector CPU | 5.5% of one core | 16.4–17.9% of one core | 8.6–14.0% of one core | 27% of one core | 8.7–13.0% of one core |
 | Detector RSS | 310 MB | 214 MB at start | 200 MB | — | 127–131 MB |
 | Accelerator busy | GR3D 0% in 215 of 239 1 s samples | NPU Core0 8–11%, cores 1–2 idle | NPU Core0 5–6%, Core1 idle | — | not measured |
 | Board state while measured | idle, load avg 0.00 | 8 containers, 2 above 1% CPU | idle, no containers | — | 10 unrelated containers |
 | Decode | NVDEC, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | Rockchip MPP, confirmed in-kernel | none — ISP dma-buf, zero-copy | ffmpeg software — the Pi 5 has no H.264 decoder |
-| Single-stream ceiling | 167 inferences/s | 31.4 inferences/s | not measured | not measured | 319 inferences/s (`hailortcli run`, idle NPU — not the pipeline apparatus) |
+| Single-stream ceiling | 167 inferences/s | 31.4 inferences/s | not measured | not measured | 84.6 frames/s end to end; 319 inferences/s (`hailortcli run`, idle NPU — not the pipeline apparatus) |
 | Multi-stream capacity, 720p @ 5 fps | 8 streams, derived from a 236 inf/s ceiling — no 8-stream run | 16 streams at full rate; knee between 24 and 32 | not measured | not measured | not measured |
 | Sustained fps | 5.0 (source-limited) | 5.0 (source-limited) | 5.0 (source-limited) | 18.8 (compute-limited) | 5.0 (source-limited) |
 
@@ -44,6 +44,13 @@ Same 1280×720 H.264 source, same truth video, same assertions.
 replay clip at a 5 fps source rate; the camera takes ISP frames over dma-buf,
 decodes nothing at all, and runs compute-limited at 18.8 fps, so neither its
 pipeline figure nor its fps compares directly.
+
+**† The Pi 5 inference figures do not span the same work as the other
+columns.** At `5ef1f6c` the detector asks HailoRT for `UINT8` outputs and
+dequantizes only the anchors that survive the confidence threshold, so
+dequantization sits outside the timer here and inside it everywhere else. The
+pre-optimization figure on the same apparatus, with dequantization inside, was
+9.7 ms p50. The full-pipeline row spans the change and is the one to compare.
 
 **Nor is the Pi 5 column, on the pipeline row.** The Pi 5 has no H.264 decoder —
 VideoCore VII is HEVC-only — so its 17.4 ms full-pipeline p50 carries a software

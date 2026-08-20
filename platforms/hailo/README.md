@@ -261,6 +261,57 @@ $ .venv/bin/python -m pytest -q
 37 passed in 0.52s
 ```
 
+### Host-side decode, measured four ways
+
+Three host-side optimizations ship on by default, selectable with
+`ESK_HAILO_OPTS` so one build and one HEF produce the whole comparison:
+`""` baseline, `"a"`, `"ab"`, `"abc"` (default).
+
+* **A** — outputs are `UINT8` and the person channel is thresholded in the
+  quantized domain. `decode_split_head` only ever reads that channel to
+  threshold and the surviving anchors' box distribution, so `FLOAT32` had
+  HailoRT convert 1 209 600 elements on the host to use roughly ten thousand.
+* **B** — `create_bindings()` and the output buffers move to `__init__`.
+* **C** — letterbox writes into a preallocated canvas, with the BGR→RGB swap
+  in place.
+
+Local video source at full speed, 15 s windows after a 5 s warmup, one fresh
+process per window, run in the order `"" → a → ab → abc` three times over.
+Interleaved rather than tier-by-tier, so drift on a board carrying ten other
+containers cannot be read as a gain:
+
+| tier | fps, median [range] | `pipeline_ms` p50 | vs baseline |
+|---|---|---:|---:|
+| `""` | 55.41 [55.32, 55.62] | 14.93 | — |
+| `"a"` | 62.30 [62.03, 62.51] | 13.10 | +12.4% |
+| `"ab"` | 63.04 [51.89, 63.32] | 12.90 | +13.8% |
+| `"abc"` | 84.57 [84.08, 84.79] | 8.83 | **+52.6%** |
+
+**C carries most of it, which is not what counting elements predicts.** A
+removes 1.2 M element conversions and buys 12%; C removes two allocations and
+one copy and buys 34% on top of A+B. The copy it removes is
+`np.ascontiguousarray(padded[:, :, ::-1])` — a negative-stride reverse on the
+last axis, so its cost per element is far above a sequential convert. Element
+count is not a proxy for time.
+
+B's own contribution is inside the noise: one of its three windows came in at
+51.89 fps against 63.04 and 63.32. That window is why the runs interleave.
+
+`inference_time_ms` p50 reads 9.07 at baseline and ~7.4 at every other tier.
+**The metric's coverage changes at A** — dequantization moves out of
+`configured.run()` and into decode — so the baseline figure is not comparable
+to the other three. That the other three are flat is the useful reading: none
+of these optimizations touches the accelerator call.
+
+The uint8 path was gated before it was timed. 155 frames of `truth.mp4`
+through `""` and `"a"`, same build, same HEF, same frame order, canvas reuse
+off in both so preprocessing is byte-identical: 155/155 frames carry a
+detection, zero box-count mismatches, and **max coordinate delta and max score
+delta are both exactly 0**. HailoRT's `FLOAT32` output equals
+`(q - qp_zp) * qp_scale` bit-for-bit on this hardware. The clip carries one
+person, so this covers the dequantization arithmetic and the threshold
+boundary but not multi-box NMS ordering under the uint8 path.
+
 ### One defect found: the process segfaults on exit
 
 Every mode exits with **139** — `--validate`, `--seconds N`, the annotate run —
