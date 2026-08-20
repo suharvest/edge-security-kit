@@ -62,6 +62,10 @@ def main(argv: list[str] | None = None) -> int:
             timeout_ms=cfg.infer_timeout_ms,
         )
         print(f"model OK: {cfg.model} backend={model.backend}")
+        print(f"host optimizations: {model.optimizations or 'none'}")
+        if model.quants is not None:
+            for name, (scale, zero_point) in zip(model.output_names, model.quants):
+                print(f"quant {name} qp_scale={scale!r} qp_zp={zero_point!r}")
         print(f"input {model.input_name} {model.input_shape}")
         for name, shape in model.output_shapes.items():
             print(f"output {name} {shape}")

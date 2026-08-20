@@ -82,6 +82,14 @@ class Detector:
             timeout_ms=cfg.infer_timeout_ms,
         )
         self.model_id = model_identifier(cfg.model)
+        LOG.info(
+            "detector host optimizations: %s (uint8_output=%s reuse_bindings=%s "
+            "reuse_canvas=%s)",
+            self.model.optimizations or "none",
+            self.model.opt_uint8_output,
+            self.model.opt_reuse_bindings,
+            self.model.opt_reuse_canvas,
+        )
         self.tracker = IoUTracker(cfg.track_iou_threshold, cfg.track_max_lost_s)
 
         base = f"{cfg.topic_prefix}/{cfg.device_id}"
@@ -271,6 +279,13 @@ class Detector:
             "frame": {"w": int(width), "h": int(height)},
             # The Hailo inference call alone, which is what the contract asks
             # for: decode and the NumPy head decode are not included.
+            #
+            # Its coverage depends on the output format. With FLOAT32 outputs
+            # HailoRT dequantizes the whole head inside run(), so that cost is
+            # counted here; with the uint8 path it is not, because it no longer
+            # happens. Comparing this field across that change measures where
+            # the boundary sits, not how fast the board is -- pipeline_ms is the
+            # field that spans both.
             "inference_time_ms": round(self.model.last_inference_ms, 3),
             "pipeline_ms": round(pipeline_ms, 3),
             "detections": items,

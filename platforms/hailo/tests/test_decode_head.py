@@ -19,8 +19,9 @@ from esk_hailo.hailo_yolo import (
     DFL_BINS,
     decode_split_head,
     group_branches,
+    quantized_threshold,
 )
-from esk_hailo.letterbox import letterbox
+from esk_hailo.letterbox import LetterboxTransform, letterbox
 
 STRIDES = (8, 16, 32)
 INPUT = 640
@@ -185,3 +186,109 @@ def test_scores_are_builtin_floats():
     assert type(det.score) is float
     assert all(type(v) is float for v in det.box)
     json.dumps({"box": det.box, "score": det.score})
+
+
+# --------------------------------------------------------------------------
+# uint8 decode path: identical detections to the FLOAT32 path
+# --------------------------------------------------------------------------
+
+
+def _quantize(values, scale, zero_point):
+    """The inverse of HailoRT's ``(q - qp_zp) * qp_scale``, saturated to uint8."""
+    q = np.rint(np.asarray(values, dtype=np.float32) / scale + zero_point)
+    return np.clip(q, 0, 255).astype(np.uint8)
+
+
+def _quantized_pair(outputs, cls_scale=1.0 / 255.0, cls_zp=0.0,
+                    box_scale=0.25, box_zp=128.0):
+    """A head as uint8 tensors plus the float32 tensors HailoRT would emit.
+
+    Both sides come from the *same* uint8 levels, which is the situation on the
+    board: HailoRT's FLOAT32 output is the dequantization of exactly the bytes
+    the uint8 output would have handed over. Comparing against the original
+    float values instead would be measuring quantization error, not the two
+    decoders against each other.
+    """
+    quants = []
+    quantized = []
+    dequantized = []
+    for arr in outputs:
+        is_box = arr.shape[-1] == BOX_CHANNELS
+        scale, zp = (box_scale, box_zp) if is_box else (cls_scale, cls_zp)
+        q = _quantize(arr, scale, zp)
+        quants.append((scale, zp))
+        quantized.append(q)
+        dequantized.append((q.astype(np.float32) - zp) * scale)
+    return quantized, dequantized, quants
+
+
+def test_quantized_threshold_matches_the_float_comparison():
+    scale, zp = 1.0 / 255.0, 0.0
+    level = quantized_threshold(0.35, scale, zp)
+    # Every level at or above must dequantize to >= the threshold once the exact
+    # re-check runs; every level below must be strictly under it.
+    assert ((level - 1) - zp) * scale < 0.35
+    assert (level + 1 - zp) * scale >= 0.35
+
+
+def test_quantized_threshold_is_none_when_unreachable():
+    # A branch whose whole uint8 span tops out below the threshold.
+    assert quantized_threshold(0.9, 1.0 / 2550.0, 0.0) is None
+
+
+def test_uint8_path_decodes_the_same_boxes_as_float32():
+    # A head with a few planted anchors across all three strides.
+    rng = np.random.default_rng(20260820)
+    outputs = []
+    for grid in (80, 40, 20):
+        box = rng.uniform(-4.0, 4.0, size=(grid, grid, BOX_CHANNELS)).astype(np.float32)
+        cls = rng.uniform(0.0, 0.30, size=(grid, grid, 80)).astype(np.float32)
+        # Plant three confident people per stride.
+        for r, c in ((3, 4), (grid // 2, grid // 2), (grid - 2, grid - 3)):
+            cls[r, c, 0] = 0.80
+        outputs.extend([box, cls])
+
+    tf = LetterboxTransform(
+        scale=0.5, pad_x=0.0, pad_y=140.0, src_w=1280, src_h=720,
+        dst_w=640, dst_h=640,
+    )
+    quantized, dequantized, quants = _quantized_pair(outputs)
+
+    reference = decode_split_head(dequantized, tf, 0.35, 0.45, 640)
+    candidate = decode_split_head(quantized, tf, 0.35, 0.45, 640, quants=quants)
+
+    assert len(reference) == len(candidate) > 0
+    for a, b in zip(reference, candidate):
+        assert a.score == pytest.approx(b.score, abs=1e-6)
+        for u, v in zip(a.box, b.box):
+            assert u == pytest.approx(v, abs=1e-9)
+
+
+def test_uint8_path_keeps_anchors_on_the_threshold_boundary():
+    """A score landing exactly on the threshold must be kept by both paths.
+
+    ``quantized_threshold`` floors, so the boundary level is admitted and the
+    exact float comparison decides. Ceiling instead would drop this anchor from
+    the uint8 path only, and the two decoders would disagree on one box in a
+    frame -- the least visible way for them to disagree.
+    """
+    scale, zp = 1.0 / 255.0, 0.0
+    level = quantized_threshold(0.35, scale, zp)
+    boundary = (level + 1 - zp) * scale  # first level at or above the threshold
+
+    outputs = []
+    for grid in (80, 40, 20):
+        box = np.zeros((grid, grid, BOX_CHANNELS), dtype=np.float32)
+        box[:, :, ::DFL_BINS] = 4.0  # bin 0 dominant -> zero distance
+        cls = np.zeros((grid, grid, 80), dtype=np.float32)
+        cls[2, 2, 0] = boundary
+        outputs.extend([box, cls])
+
+    tf = LetterboxTransform(
+        scale=0.5, pad_x=0.0, pad_y=140.0, src_w=1280, src_h=720,
+        dst_w=640, dst_h=640,
+    )
+    quantized, dequantized, quants = _quantized_pair(outputs)
+    reference = decode_split_head(dequantized, tf, 0.35, 0.45, 640)
+    candidate = decode_split_head(quantized, tf, 0.35, 0.45, 640, quants=quants)
+    assert len(candidate) == len(reference)

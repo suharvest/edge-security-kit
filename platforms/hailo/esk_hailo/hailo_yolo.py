@@ -15,6 +15,20 @@ limitation:
   known ``[0, 1]`` range the optimizer can pin exactly. :meth:`detect` asserts
   the range on the first inference, so a HEF built without that model-script
   line fails loudly instead of publishing scores that are really logits.
+* **The head comes back as uint8 and is thresholded in the quantized domain.**
+  HailoRT's FLOAT32 output format dequantizes all 1209600 elements of this head
+  on the host, and the decoder reads 8400 of them -- the person channel -- to
+  decide anything at all. The threshold is converted into a uint8 level instead
+  (``q >= qp_zp + conf / qp_scale``), the comparison runs on the raw bytes, and
+  only the surviving anchors' score and box distribution are converted. The
+  parameters come from the same ``InferModel`` the tensors do, so they cannot
+  describe a different HEF than the one loaded.
+
+  **This moves work out of ``inference_time_ms``**, which times
+  ``configured.run()`` alone: the dequantization used to happen inside that call
+  and now happens in the decoder, outside it. The metric falls without the
+  pipeline necessarily getting faster, so ``pipeline_ms`` is the figure to
+  compare across this change and ``inference_time_ms`` is not.
 * **DFL, the box decode and NMS run here in NumPy.** The arithmetic is a port
   of ``platforms/rknn``'s ``decode_zoo_head`` -- same DFL mean, same anchor
   centres, same greedy NMS -- because two platforms decoding the same head with
@@ -30,12 +44,19 @@ re-translated; a shape-driven mapping survives a recompile.
 
 from __future__ import annotations
 
+import math
+import os
 import time
 from dataclasses import dataclass
 
 import numpy as np
 
-from .letterbox import LetterboxTransform, letterbox, xyxy_to_frame_norm
+from .letterbox import (
+    LetterboxCanvas,
+    LetterboxTransform,
+    letterbox,
+    xyxy_to_frame_norm,
+)
 
 PERSON_CLASS_ID = 0
 PERSON_CLASS_NAME = "person"
@@ -95,19 +116,28 @@ def _dfl_distances(dist_logits: np.ndarray) -> np.ndarray:
     return np.tensordot(np.arange(DFL_BINS, dtype=np.float32), weights, axes=([0], [1]))
 
 
-def group_branches(outputs) -> list[tuple[np.ndarray, np.ndarray]]:
+def _as_hwc(raw) -> np.ndarray:
+    """One head output as a plain HWC array, batch dimension squeezed."""
+    arr = np.asarray(raw)
+    if arr.ndim == 4:
+        arr = np.squeeze(arr, axis=0)
+    if arr.ndim != 3:
+        raise ValueError(f"expected an NHWC head output, got shape {arr.shape}")
+    return arr
+
+
+def group_branch_indices(outputs) -> tuple[list[np.ndarray], list[tuple[int, int]]]:
     """Pair each stride's ``(box_distribution, class_map)`` by tensor shape.
 
-    ``outputs`` is any iterable of NHWC (or squeezable NHWC-with-batch) arrays.
-    Returned coarsest-grid-last, i.e. stride 8, 16, 32.
+    Returns the squeezed arrays alongside ``(box_index, class_index)`` pairs
+    *into that list*, coarsest-grid-last, i.e. stride 8, 16, 32. Indices rather
+    than arrays because the quantized path needs to look each branch's
+    scale/zero-point up by the same position, and re-deriving that pairing in a
+    second place is how the two halves drift apart.
     """
-    by_grid: dict[tuple[int, int], dict[int, np.ndarray]] = {}
-    for raw in outputs:
-        arr = np.asarray(raw)
-        if arr.ndim == 4:
-            arr = np.squeeze(arr, axis=0)
-        if arr.ndim != 3:
-            raise ValueError(f"expected an NHWC head output, got shape {arr.shape}")
+    arrays = [_as_hwc(raw) for raw in outputs]
+    by_grid: dict[tuple[int, int], dict[int, int]] = {}
+    for index, arr in enumerate(arrays):
         grid_h, grid_w, channels = arr.shape
         slot = by_grid.setdefault((grid_h, grid_w), {})
         if channels in slot:
@@ -115,20 +145,44 @@ def group_branches(outputs) -> list[tuple[np.ndarray, np.ndarray]]:
                 f"two {channels}-channel tensors on the {grid_h}x{grid_w} grid: "
                 "the box and class branches cannot be told apart"
             )
-        slot[channels] = arr
+        slot[channels] = index
 
-    branches: list[tuple[np.ndarray, np.ndarray]] = []
+    pairs: list[tuple[int, int]] = []
     for grid, slot in sorted(by_grid.items(), reverse=True):
         if len(slot) != 2 or BOX_CHANNELS not in slot:
             raise ValueError(
                 f"grid {grid[0]}x{grid[1]} has channels {sorted(slot)}, expected "
                 f"exactly one {BOX_CHANNELS}-channel box tensor and one class map"
             )
-        cls = next(v for c, v in slot.items() if c != BOX_CHANNELS)
-        branches.append((slot[BOX_CHANNELS], cls))
-    if len(branches) != 3:
-        raise ValueError(f"expected 3 strides, got {len(branches)}")
-    return branches
+        cls_index = next(v for c, v in slot.items() if c != BOX_CHANNELS)
+        pairs.append((slot[BOX_CHANNELS], cls_index))
+    if len(pairs) != 3:
+        raise ValueError(f"expected 3 strides, got {len(pairs)}")
+    return arrays, pairs
+
+
+def group_branches(outputs) -> list[tuple[np.ndarray, np.ndarray]]:
+    """``(box_distribution, class_map)`` per stride, coarsest-grid-last."""
+    arrays, pairs = group_branch_indices(outputs)
+    return [(arrays[b], arrays[c]) for b, c in pairs]
+
+
+def quantized_threshold(conf_threshold: float, scale: float, zero_point: float):
+    """Lowest uint8 level that can dequantize to ``conf_threshold`` or above.
+
+    HailoRT dequantizes as ``(q - qp_zp) * qp_scale``, so the comparison
+    ``value >= conf`` is ``q >= zp + conf / scale`` in the quantized domain.
+    ``floor`` rather than ``ceil``: the boundary level is admitted and the exact
+    float comparison is redone on the handful of survivors, so a level that
+    rounds either way cannot be dropped here. Returns ``None`` when no uint8
+    level can reach the threshold.
+    """
+    if scale <= 0.0:
+        raise ValueError(f"non-positive quantization scale {scale}")
+    level = math.floor(zero_point + conf_threshold / scale)
+    if level > 255:
+        return None
+    return max(0, int(level))
 
 
 def decode_split_head(
@@ -137,23 +191,60 @@ def decode_split_head(
     conf_threshold: float,
     iou_threshold: float,
     input_size: int = 640,
+    quants: list[tuple[float, float]] | None = None,
 ) -> list[Detection]:
     """Decode the six-output YOLOv8 head into ``frame_norm`` detections.
 
     The class map arrives with sigmoid already applied on-chip, so its values
     are probabilities and are thresholded directly.
+
+    ``quants`` switches the whole function into the quantized domain: pass one
+    ``(scale, zero_point)`` per entry of ``outputs``, positionally, and the
+    tensors are expected to be the raw uint8 the accelerator wrote. Nothing is
+    dequantized wholesale -- the person channel is thresholded as uint8, and
+    only the surviving anchors' score and box distribution are converted. On
+    this head that is 8400 uint8 comparisons and typically under 1300 floats,
+    against 1209600 elements HailoRT would otherwise convert on the host.
     """
+    arrays, pairs = group_branch_indices(outputs)
     boxes_all: list[np.ndarray] = []
     scores_all: list[np.ndarray] = []
-    for dist, cls in group_branches(outputs):
-        grid_h, grid_w = cls.shape[0], cls.shape[1]
+    for dist_index, cls_index in pairs:
+        dist, cls = arrays[dist_index], arrays[cls_index]
+        grid_h = cls.shape[0]
         person = cls[:, :, PERSON_CLASS_ID]
-        rows, cols = np.nonzero(person >= conf_threshold)
-        if rows.size == 0:
-            continue
-        # (k, 64) -> (64, k) to match the DFL reshape, then decode only the
-        # anchors that survived the threshold.
-        distances = _dfl_distances(dist[rows, cols, :].T)
+
+        if quants is None:
+            rows, cols = np.nonzero(person >= conf_threshold)
+            if rows.size == 0:
+                continue
+            scores = person[rows, cols].astype(np.float32)
+            # (k, 64) -> decoded below as (64, k) to match the DFL reshape.
+            selected = dist[rows, cols, :].astype(np.float32)
+        else:
+            cls_scale, cls_zp = quants[cls_index]
+            box_scale, box_zp = quants[dist_index]
+            level = quantized_threshold(conf_threshold, cls_scale, cls_zp)
+            if level is None:
+                continue
+            rows, cols = np.nonzero(person >= level)
+            if rows.size == 0:
+                continue
+            scores = (person[rows, cols].astype(np.float32) - cls_zp) * cls_scale
+            # The uint8 threshold admits the boundary level; this is the exact
+            # comparison the float32 path makes, on the survivors only, so the
+            # two paths keep the same anchors and not merely similar ones.
+            kept = scores >= conf_threshold
+            if not kept.all():
+                rows, cols, scores = rows[kept], cols[kept], scores[kept]
+                if rows.size == 0:
+                    continue
+            # DFL is a softmax, which is not invariant to the quantization
+            # scale, so the box distribution has to be dequantized before the
+            # mean is taken. The zero point would cancel; the scale would not.
+            selected = (dist[rows, cols, :].astype(np.float32) - box_zp) * box_scale
+
+        distances = _dfl_distances(selected.T)
         stride = input_size / grid_h
         cx = cols.astype(np.float32) + 0.5
         cy = rows.astype(np.float32) + 0.5
@@ -168,7 +259,7 @@ def decode_split_head(
                 axis=1,
             )
         )
-        scores_all.append(person[rows, cols].astype(np.float32))
+        scores_all.append(scores.astype(np.float32))
 
     if not boxes_all:
         return []
@@ -207,6 +298,7 @@ class HailoPersonDetector:
         iou_threshold: float = 0.45,
         input_size: int = 640,
         timeout_ms: int = 5000,
+        optimizations: str | None = None,
     ) -> None:
         from hailo_platform import FormatType, HailoSchedulingAlgorithm, VDevice
 
@@ -217,6 +309,27 @@ class HailoPersonDetector:
         self.last_inference_ms = 0.0
         self._range_checked = False
 
+        # Which of the three host-side optimizations are on. All three are the
+        # shipped path; the switch exists so a measurement run can turn them off
+        # one at a time on the same binary, which is the only way to attribute a
+        # change to one of them rather than to the board having warmed up.
+        opts = optimizations
+        if opts is None:
+            opts = os.environ.get("ESK_HAILO_OPTS", "abc")
+        opts = opts.lower()
+        self.opt_uint8_output = "a" in opts
+        self.opt_reuse_bindings = "b" in opts
+        self.opt_reuse_canvas = "c" in opts
+        self.optimizations = "".join(
+            flag
+            for flag, on in (
+                ("a", self.opt_uint8_output),
+                ("b", self.opt_reuse_bindings),
+                ("c", self.opt_reuse_canvas),
+            )
+            if on
+        )
+
         params = VDevice.create_params()
         # ROUND_ROBIN lets the HailoRT scheduler share the device with any other
         # process that has it open. The board this was measured on runs an
@@ -225,13 +338,20 @@ class HailoPersonDetector:
         self.vdevice = VDevice(params)
         self.infer_model = self.vdevice.create_infer_model(hef_path)
         self.infer_model.set_batch_size(1)
-        # FLOAT32 outputs: HailoRT dequantizes on the host. The alternative is
-        # decoding uint8 with per-tensor scale/zero-point here, which buys a few
-        # hundred microseconds and adds a second place for the quantization
-        # parameters to be wrong.
+
+        # UINT8 outputs: the host never dequantizes a full tensor. HailoRT's
+        # FLOAT32 format converts all 1209600 elements of this head on the CPU,
+        # while the decoder reads 8400 of them to threshold and a few hundred
+        # more for the boxes that survive. The quantization parameters come from
+        # the same InferModel the tensors do (`quant_infos`, fields `qp_scale`
+        # and `qp_zp`), so there is no second place for them to be wrong.
         self.output_names = [vs.name for vs in self.infer_model.outputs]
+        fmt = FormatType.UINT8 if self.opt_uint8_output else FormatType.FLOAT32
         for name in self.output_names:
-            self.infer_model.output(name).set_format_type(FormatType.FLOAT32)
+            self.infer_model.output(name).set_format_type(fmt)
+        self.output_dtype = np.uint8 if self.opt_uint8_output else np.float32
+        self.quants = self._read_quant_infos() if self.opt_uint8_output else None
+
         self.input_name = self.infer_model.inputs[0].name
         self.input_shape = tuple(self.infer_model.input(self.input_name).shape)
         self.configured = self.infer_model.configure()
@@ -239,8 +359,54 @@ class HailoPersonDetector:
             name: tuple(self.infer_model.output(name).shape)
             for name in self.output_names
         }
+
+        # One set of output buffers and one bindings object for the life of the
+        # detector. Rebuilding them per frame allocates six arrays and crosses
+        # into pybind11 six more times for work whose result never changes.
+        self._buffers: dict[str, np.ndarray] | None = None
+        self._bindings = None
+        if self.opt_reuse_bindings:
+            self._buffers = self._new_buffers()
+            self._bindings = self.configured.create_bindings(
+                output_buffers=self._buffers
+            )
+
+        self._canvas = (
+            LetterboxCanvas(self.input_size, self.input_size)
+            if self.opt_reuse_canvas
+            else None
+        )
+
         self.device_arch = self._device_arch()
         self.runtime_version = self._runtime_version()
+
+    def _new_buffers(self) -> dict[str, np.ndarray]:
+        return {
+            name: np.empty(shape, dtype=self.output_dtype)
+            for name, shape in self._out_shapes.items()
+        }
+
+    def _read_quant_infos(self) -> list[tuple[float, float]]:
+        """``(qp_scale, qp_zp)`` per output, positionally by ``output_names``.
+
+        ``InferModel.InferStream.quant_infos`` returns a list because a HEF may
+        carry per-channel parameters. This decoder thresholds a whole channel
+        map against one level, which only means anything with a single set, so
+        a multi-parameter output is refused rather than silently decoded with
+        the first entry.
+        """
+        quants: list[tuple[float, float]] = []
+        for name in self.output_names:
+            infos = self.infer_model.output(name).quant_infos
+            if len(infos) != 1:
+                raise RuntimeError(
+                    f"output {name} carries {len(infos)} quantization infos; the "
+                    "uint8 decode path needs exactly one per tensor. Re-run with "
+                    "ESK_HAILO_OPTS excluding 'a' to fall back to FLOAT32 outputs."
+                )
+            info = infos[0]
+            quants.append((float(info.qp_scale), float(info.qp_zp)))
+        return quants
 
     # ------------------------------------------------------------- identity
 
@@ -272,7 +438,14 @@ class HailoPersonDetector:
     # ------------------------------------------------------------ inference
 
     def preprocess(self, frame: np.ndarray) -> tuple[np.ndarray, LetterboxTransform]:
-        """BGR frame -> uint8 NHWC RGB letterbox canvas plus its transform."""
+        """BGR frame -> uint8 NHWC RGB letterbox canvas plus its transform.
+
+        With the canvas optimization on, the returned array is reused by the
+        next call. The frame loop consumes it inside :meth:`detect` before it
+        reads another frame, which is what makes that safe.
+        """
+        if self._canvas is not None:
+            return self._canvas.convert(frame)
         padded, tf = letterbox(frame, self.input_size, self.input_size)
         return np.ascontiguousarray(padded[:, :, ::-1]), tf
 
@@ -280,11 +453,14 @@ class HailoPersonDetector:
         """Run one inference on a uint8 HWC RGB letterbox canvas."""
         if rgb_canvas.dtype != np.uint8:
             raise ValueError("Hailo input must stay uint8; the HEF normalizes")
-        buffers = {
-            name: np.empty(shape, dtype=np.float32)
-            for name, shape in self._out_shapes.items()
-        }
-        bindings = self.configured.create_bindings(output_buffers=buffers)
+        if self._bindings is not None:
+            buffers = self._buffers
+            bindings = self._bindings
+        else:
+            buffers = self._new_buffers()
+            bindings = self.configured.create_bindings(output_buffers=buffers)
+        # Set every frame either way: the canvas is reused but its address is
+        # not guaranteed, and re-binding an unchanged pointer is free.
         bindings.input().set_buffer(rgb_canvas)
         started = time.perf_counter()
         self.configured.run([bindings], self.timeout_ms)
@@ -300,8 +476,30 @@ class HailoPersonDetector:
         wrong by a monotonic transform, so every threshold in the stack is
         silently off. Checked once, on real data, rather than trusted.
         """
-        for _, cls in group_branches(outputs):
-            lo, hi = float(cls.min()), float(cls.max())
+        arrays, pairs = group_branch_indices(outputs)
+        for _, cls_index in pairs:
+            cls = arrays[cls_index]
+            if self.quants is None:
+                lo, hi = float(cls.min()), float(cls.max())
+            else:
+                scale, zero_point = self.quants[cls_index]
+                # Two checks, and the first is the stronger one. A uint8 tensor
+                # cannot show an out-of-range *observed* value however the HEF
+                # was built -- the range is carried by the quantization
+                # parameters, not by the samples -- so what settles it is the
+                # span the parameters can represent at all. A branch left as
+                # logits is pinned to something like [-20, 20] and fails here on
+                # the first frame, whatever that frame happened to contain.
+                span_lo = (0.0 - zero_point) * scale
+                span_hi = (255.0 - zero_point) * scale
+                if span_lo < -1e-3 or span_hi > 1.0 + 1e-3:
+                    raise RuntimeError(
+                        f"class branch quantization spans [{span_lo:.4f}, "
+                        f"{span_hi:.4f}], not a probability: the HEF was compiled "
+                        "without change_output_activation(sigmoid)"
+                    )
+                lo = (float(cls.min()) - zero_point) * scale
+                hi = (float(cls.max()) - zero_point) * scale
             if lo < -1e-3 or hi > 1.0 + 1e-3:
                 raise RuntimeError(
                     f"class branch range [{lo:.4f}, {hi:.4f}] is not a probability: "
@@ -314,7 +512,12 @@ class HailoPersonDetector:
         if not self._range_checked:
             self._check_class_range(outputs)
         return decode_split_head(
-            outputs, tf, self.conf_threshold, self.iou_threshold, self.input_size
+            outputs,
+            tf,
+            self.conf_threshold,
+            self.iou_threshold,
+            self.input_size,
+            quants=self.quants,
         )
 
     def __call__(self, frame: np.ndarray) -> list[Detection]:
@@ -338,8 +541,12 @@ class HailoPersonDetector:
             self.configured.shutdown()
         except Exception:  # pragma: no cover - teardown only
             pass
-        # Drop the Python references so pybind11 runs both destructors here,
-        # while the device they point into is still alive.
+        # Drop the Python references so pybind11 runs the destructors here,
+        # while the device they point into is still alive. Bindings first: they
+        # hold a handle into ConfiguredInferModel the same way it holds one into
+        # the VDevice, so the same teardown-order defect applies one level down.
+        self._bindings = None
+        self._buffers = None
         self.configured = None
         self.infer_model = None
         try:

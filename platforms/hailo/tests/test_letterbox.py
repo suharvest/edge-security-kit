@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from esk_hailo.letterbox import frame_norm_to_pixels, letterbox, xyxy_to_frame_norm
+from esk_hailo.letterbox import (
+    LetterboxCanvas,
+    frame_norm_to_pixels,
+    letterbox,
+    xyxy_to_frame_norm,
+)
 
 
 def test_letterbox_preserves_aspect_and_pads_to_square():
@@ -74,3 +79,49 @@ def test_bbox_clamped_into_unit_range():
     cx, cy, w, h = bbox
     assert cx - w / 2 >= -1e-9 and cx + w / 2 <= 1.0 + 1e-9
     assert cy - h / 2 >= -1e-9 and cy + h / 2 <= 1.0 + 1e-9
+
+
+# --------------------------------------------------------------------------
+# LetterboxCanvas: byte-identical to letterbox() + the BGR->RGB flip
+# --------------------------------------------------------------------------
+
+
+def test_canvas_matches_letterbox_byte_for_byte():
+    """The reused canvas must equal the allocating path exactly, not closely.
+
+    The optimization removes two 1.2 MB allocations and a full copy per frame.
+    Anything short of byte equality here means the model sees different input
+    than the path every published measurement was taken on, and every downstream
+    difference would then be unattributable.
+    """
+    rng = np.random.default_rng(7)
+    for src_w, src_h in ((1280, 720), (640, 640), (1920, 1080), (320, 240)):
+        frame = rng.integers(0, 256, size=(src_h, src_w, 3), dtype=np.uint8)
+        padded, want_tf = letterbox(frame, 640, 640)
+        want = np.ascontiguousarray(padded[:, :, ::-1])
+
+        canvas = LetterboxCanvas(640, 640)
+        got, got_tf = canvas.convert(frame)
+
+        assert got.shape == want.shape and got.dtype == want.dtype
+        assert np.array_equal(got, want), f"{src_w}x{src_h} canvas differs"
+        assert got_tf == want_tf
+
+
+def test_canvas_reuses_one_buffer_and_survives_a_resolution_change():
+    """Same array object every call, and no stale pixels after a reshape."""
+    rng = np.random.default_rng(11)
+    canvas = LetterboxCanvas(640, 640)
+
+    wide = rng.integers(0, 256, size=(720, 1280, 3), dtype=np.uint8)
+    first, _ = canvas.convert(wide)
+    second, _ = canvas.convert(wide)
+    assert first is second is canvas.canvas
+
+    # A taller source pads left/right instead of top/bottom. If the pad were
+    # repainted only where the previous geometry had it, the old top band would
+    # survive as image data.
+    tall = rng.integers(0, 256, size=(1080, 720, 3), dtype=np.uint8)
+    got, _ = canvas.convert(tall)
+    padded, _ = letterbox(tall, 640, 640)
+    assert np.array_equal(got, np.ascontiguousarray(padded[:, :, ::-1]))

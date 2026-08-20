@@ -102,3 +102,81 @@ def frame_norm_to_pixels(
         int(round((cx + w / 2) * width)),
         int(round((cy + h / 2) * height)),
     )
+
+
+class LetterboxCanvas:
+    """Reusable letterbox target that writes straight into an RGB canvas.
+
+    :func:`letterbox` allocates a resized image, then ``copyMakeBorder``
+    allocates the padded one, and the caller then allocates a third array to
+    flip BGR to RGB. At 640x640x3 that is two extra 1.2 MB buffers and one full
+    copy per frame, on a board where the whole inference call is ~10 ms.
+
+    This class keeps one 640x640x3 uint8 canvas for the life of the detector:
+    ``cv2.resize`` writes the scaled frame directly into the canvas ROI, and the
+    BGR->RGB swap runs in place on that ROI. The pad border is painted once and
+    then never touched again, because the ROI is the only region any frame
+    writes to and its geometry only changes if the source resolution does.
+
+    The arithmetic -- scale, rounded size, integer pad -- is copied from
+    :func:`letterbox` rather than re-derived, so the two produce byte-identical
+    canvases and the same :class:`LetterboxTransform`.
+    """
+
+    def __init__(
+        self,
+        dst_w: int,
+        dst_h: int,
+        color: tuple[int, int, int] = (114, 114, 114),
+    ) -> None:
+        self.dst_w = int(dst_w)
+        self.dst_h = int(dst_h)
+        # Stored RGB, because the canvas is handed to the accelerator as RGB and
+        # the pad has to be the same grey in both orders anyway.
+        self.color = (int(color[2]), int(color[1]), int(color[0]))
+        self.canvas = np.empty((self.dst_h, self.dst_w, 3), dtype=np.uint8)
+        self._geometry: tuple[int, int] | None = None
+        self._transform: LetterboxTransform | None = None
+        self._roi: np.ndarray | None = None
+
+    def _reshape_for(self, src_w: int, src_h: int) -> None:
+        scale = min(self.dst_w / src_w, self.dst_h / src_h)
+        new_w, new_h = int(round(src_w * scale)), int(round(src_h * scale))
+        pad_x = (self.dst_w - new_w) / 2.0
+        pad_y = (self.dst_h - new_h) / 2.0
+        top, left = int(round(pad_y - 0.1)), int(round(pad_x - 0.1))
+        # Repaint the whole canvas, not just the four border strips: this runs
+        # once per source resolution, and a partial repaint is one more place
+        # for an off-by-one to leave a stale stripe in the model input.
+        self.canvas[:, :, :] = self.color
+        self._roi = self.canvas[top : top + new_h, left : left + new_w]
+        self._interp = cv2.INTER_LINEAR if scale > 1 else cv2.INTER_AREA
+        self._new_size = (new_w, new_h)
+        self._geometry = (src_w, src_h)
+        self._transform = LetterboxTransform(
+            scale=scale,
+            pad_x=float(left),
+            pad_y=float(top),
+            src_w=src_w,
+            src_h=src_h,
+            dst_w=self.dst_w,
+            dst_h=self.dst_h,
+        )
+
+    def convert(self, frame: np.ndarray) -> tuple[np.ndarray, LetterboxTransform]:
+        """BGR frame -> the reused uint8 RGB canvas plus its transform.
+
+        The returned array is the canvas itself and is overwritten by the next
+        call, which is safe for the detector's frame loop (inference consumes it
+        before the next frame is read) and is the whole point of the class.
+        """
+        src_h, src_w = frame.shape[:2]
+        if self._geometry != (src_w, src_h):
+            self._reshape_for(src_w, src_h)
+        assert self._roi is not None and self._transform is not None
+        # dst= writes into the canvas ROI. The view is row-strided but each row
+        # is contiguous, which is exactly what OpenCV's step-based Mat wants.
+        cv2.resize(frame, self._new_size, dst=self._roi, interpolation=self._interp)
+        # In-place channel swap on the ROI only. The pad is grey in both orders.
+        cv2.cvtColor(self._roi, cv2.COLOR_BGR2RGB, dst=self._roi)
+        return self.canvas, self._transform
