@@ -322,11 +322,28 @@ class HailoPersonDetector:
         return self.detect(canvas, tf)
 
     def close(self) -> None:
+        """Tear down in dependency order, wrappers before the device.
+
+        ``ConfiguredInferModel`` and ``InferModel`` hold handles into the
+        ``VDevice``. Releasing the device first leaves their destructors to
+        run against freed memory at interpreter exit, which segfaults after
+        every message has already been published -- so the process prints a
+        complete, correct result and then exits 139, and a supervisor cannot
+        tell that from a real crash. Drop the wrappers first, then release.
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         try:
             self.configured.shutdown()
         except Exception:  # pragma: no cover - teardown only
             pass
+        # Drop the Python references so pybind11 runs both destructors here,
+        # while the device they point into is still alive.
+        self.configured = None
+        self.infer_model = None
         try:
             self.vdevice.release()
         except Exception:  # pragma: no cover - teardown only
             pass
+        self.vdevice = None
