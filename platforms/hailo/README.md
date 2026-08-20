@@ -278,4 +278,24 @@ interpreter exit, past the last publish. It matters anyway: a supervisor
 (systemd, Docker restart policy) reads 139 as a crash, so a clean shutdown is
 indistinguishable from a failure, and `contracts/MQTT.md`'s clean-exit path (a
 retained `online: false` written on DISCONNECT rather than via the LWT) cannot be
-relied on. Not fixed here; the VDevice teardown ordering is where to look.
+relied on.
+
+**Fixed in `dbc42ef`.** `close()` released the `VDevice` while `self.configured`
+and `self.infer_model` still held pybind11 handles into it, so both destructors
+ran at interpreter exit against a freed device. Dropping the two wrappers first,
+then releasing, makes their destructors run while the device is still alive.
+
+Confirmed on the board with a negative control — without one, an exit code of 0
+only shows that *something* changed, not that this change caused it:
+
+| mode | fixed | `close()` reverted to the old order |
+|---|---|---|
+| `--validate` | rc=0 (twice) | rc=139 |
+| `--seconds N` | rc=0 (twice) | rc=135 |
+
+The old order gives **135 (SIGBUS) on `--seconds` and 139 (SIGSEGV) on
+`--validate`** — the same defect, but not even a consistent bad exit code, which
+is worse for a supervisor than a single reliable one. The reverted build's
+stdout was also lost on the first attempt: the fault killed the process before
+the block-buffered pipe flushed, so the run has to be repeated unbuffered to see
+that the work had in fact completed.
