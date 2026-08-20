@@ -94,7 +94,13 @@ B 比 A 低 **269 倍**，与 ctypes 对照组的 0.054 kB/次 同量级。代�
 `inference()` 返回给调用方的 numpy 数组，所以脚本里的 `del outputs` 对它无效。
 
 **结论**：`RKNNLite.inference()` 每次调用留下一组引用环，环里挂着该次推理的 ctypes
-缓冲区。引用环对 refcount 不可见，只有 gc 能拆。A 组是在 gc 启用的默认配置下跑的，
+缓冲区。引用环对 refcount 不可见，只有 gc 能拆。
+
+产生环的代码在 `rknnlite/api/rknn_runtime.cpython-311-aarch64-linux-gnu.so` 里——该
+模块由 Cython 编译（`strings` 可见 `__pyx_*` 符号），内部用 **ctypes** 调 `librknnrt`
+（可见 `CDLL`、`POINTER`、`RKNNRtTensorAttr`）。所以环由 ctypes 对象构成，但构造它们
+的是那个 Cython 模块，不是调用方的代码——这也是 `del outputs` 无效的原因。Rockchip
+持有对应的 `.pyx` 源码，定位到具体构造点对他们是可行的；从外部只能到「封装层」这一层。A 组是在 gc 启用的默认配置下跑的，
 自动 gc 没有跟上环的产生速率（环内对象存活进老年代后，full collection 的触发间隔随堆
 增大而拉长——机制层面的解释需核实，但「自动 gc 跟不上」本身是 A 组的直接读数）。
 

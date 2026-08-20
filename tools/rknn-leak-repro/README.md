@@ -25,6 +25,8 @@ buffers.** Reference cycles are invisible to refcounting; only the cyclic
 collector breaks them. This is not a C-level `malloc` without a matching
 `free`.
 
+The cycles are built inside `rknnlite/api/rknn_runtime.cpython-311-aarch64-linux-gnu.so`, which is Cython-compiled (`__pyx_*` symbols) and reaches `librknnrt` through **ctypes** (`CDLL`, `POINTER`, `RKNNRtTensorAttr`). So the objects in the cycle are ctypes objects, but the code constructing them is the vendor's compiled module, not the caller's — which is why `del outputs` on your side does nothing.
+
 Both scripts use the same warmup, the same sampling interval and the same
 kB-per-inference arithmetic, so their numbers are directly comparable. That is
 the only reason the comparison means anything.
