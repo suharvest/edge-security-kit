@@ -65,6 +65,14 @@ class DeviceRegistry:
             "versions": payload.get("versions") or previous.get("versions") or {},
             "uptime_s": payload.get("uptime_s"),
             "streams": [dict(s) for s in streams],
+            # Carried through from health so /api/devices can answer "which
+            # runtime is this actually running" without a subscriber having to
+            # tap MQTT. Falls back to the previous value like versions does: a
+            # goodbye or LWT payload has no health block, and blanking the
+            # field on the way down would lose it exactly when someone is
+            # looking at why the device went away.
+            "backend": (payload.get("health") or {}).get("backend")
+            or previous.get("backend"),
             "fallback_active": bool((payload.get("health") or {}).get("fallback_active"))
             or any(bool(s.get("fallback_active")) for s in streams),
         }
@@ -103,6 +111,11 @@ class DeviceRegistry:
         if before.get("online") != after.get("online"):
             return True
         if before.get("fallback_active") != after.get("fallback_active"):
+            return True
+        # A runtime swapped underneath a device -- a rebuilt image, a driver
+        # upgrade -- changes what its numbers mean, so it is worth a push
+        # rather than something a reader notices on the next poll.
+        if before.get("backend") != after.get("backend"):
             return True
         def digest(entry: dict[str, Any]) -> list[tuple[Any, ...]]:
             return [
