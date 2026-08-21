@@ -9,8 +9,24 @@ requires-python = ">=3.10"
 # matches `hailortcli --version` on the target, not resolved from an index. The
 # PyPI project called `hailort` is an unrelated stub.
 dependencies = [
-    "numpy>=1.26",
-    "opencv-python-headless>=4.9",
+    # numpy<2 is not a preference, it is HailoRT's own constraint restated.
+    # `_pyhailort` is built against the numpy 1.x C ABI: under numpy 2 the
+    # array handed to `set_buffer()` is read as size 0 on the C++ side, so
+    # `validate_bindings` rejects every frame with
+    # "Input buffer size 0 is different than expected 1228800" while the Python
+    # side reports the buffer as correct. It fails at the first inference, not
+    # at import, and nothing in the message points at numpy.
+    #
+    # The hailort wheel declares `Requires-Dist: numpy<2` itself, so a venv
+    # that installs it inherits the bound. This image deliberately does NOT
+    # carry hailort -- it is board-supplied -- and excluding it from the lock
+    # also dropped its constraint on the packages we do ship, which is how a
+    # numpy 2.4.6 image got built and shipped. Restated here so the bound
+    # survives that exclusion.
+    "numpy>=1.26,<2",
+    # Held below 5 for the same reason: opencv 5 requires numpy>=2 and would
+    # drag the above back over the line.
+    "opencv-python-headless>=4.9,<5",
     "paho-mqtt>=1.6,<2.0",
     "pyyaml>=6.0",
 ]

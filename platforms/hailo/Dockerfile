@@ -104,7 +104,20 @@ RUN cd /app/models \
 
 # Checks only what the image itself owns. hailo_platform is intentionally
 # missing here and is not checked — it arrives from the board at /hailosite.
-RUN python3 -c "import numpy, cv2, yaml, paho.mqtt.client; print('numpy', numpy.__version__, '| cv2', cv2.__version__)"
+#
+# The numpy major-version assertion is load-bearing. `_pyhailort` is built
+# against the numpy 1.x C ABI, and under numpy 2 the array passed to
+# `set_buffer()` reads as size 0 on the C++ side: every frame is rejected with
+# "Input buffer size 0 is different than expected 1228800" at the first
+# inference, with nothing in the message naming numpy. The hailort wheel
+# carries `Requires-Dist: numpy<2`, but this image does not install hailort —
+# it is board-supplied — so that constraint does not reach the resolver here
+# and has to be restated in pyproject.toml. This line fails the build rather
+# than shipping an image that deploys cleanly and cannot infer.
+RUN python3 -c "import numpy, cv2, yaml, paho.mqtt.client; \
+    assert numpy.__version__.split('.')[0] == '1', \
+        'numpy %s: _pyhailort needs the 1.x ABI, see pyproject.toml' % numpy.__version__; \
+    print('numpy', numpy.__version__, '| cv2', cv2.__version__)"
 
 EXPOSE 8099
 
