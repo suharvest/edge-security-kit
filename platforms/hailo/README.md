@@ -308,9 +308,38 @@ through `""` and `"a"`, same build, same HEF, same frame order, canvas reuse
 off in both so preprocessing is byte-identical: 155/155 frames carry a
 detection, zero box-count mismatches, and **max coordinate delta and max score
 delta are both exactly 0**. HailoRT's `FLOAT32` output equals
-`(q - qp_zp) * qp_scale` bit-for-bit on this hardware. The clip carries one
-person, so this covers the dequantization arithmetic and the threshold
-boundary but not multi-box NMS ordering under the uint8 path.
+`(q - qp_zp) * qp_scale` bit-for-bit on this hardware.
+
+That first run compared post-NMS detections on a single-person clip, so every
+frame carried one box: it proved the dequantization arithmetic but left the
+threshold-relaxation branch and the DFL reshape for several simultaneous
+anchors untouched. Lowering the confidence threshold does not fix that on its
+own — NMS collapses the extra anchors and the post-NMS count stays at one. The
+comparison has to happen **before** NMS, which is the level those two paths run
+at:
+
+| gate | conf | boxes | anchors per frame | max coord dev | max score dev |
+|---|---|---:|---|---|---|
+| pre-NMS | 0.05 | 1571 | 10 – 12 | 0 | 0 |
+| post-NMS | 0.05 | 155 | 1 | 0 | 0 |
+| pre-NMS | 0.0079 | 1589 | 10 – 12 | 0 | 0 |
+
+All 155 frames run at k = 10–12, so the `(4, DFL_BINS, -1)` reshape is no
+longer exercised only in its trivial k = 1 form. `quantized_threshold` floors
+to level 12 at conf 0.05, which dequantizes to 0.047059 — below the threshold,
+so the relaxation is real and the exact re-check runs on every survivor. Its
+*rejection* branch needs a lower threshold to appear at all: at conf 0.0079 the
+floor admits 1594 anchors and the float compare drops 5 of them, across 5
+frames. That is what the third gate is for.
+
+Two limits of this fixture, both stated rather than worked around. The person
+channel quantizes with scale 1/255 and zero point 0, and reads exactly q = 0 on
+almost every anchor, so the totals cannot be pushed past ~1.6 k by lowering the
+threshold further — reaching thousands needs different footage. And strides 8
+and 16 contribute no anchors at any threshold on this clip: one large subject
+is found by the 20x20 grid alone, so the k > 1 decode is validated on that
+stride only. Both paths agree there, so neither is a divergence risk; they are
+gaps in what the clip can reach.
 
 ### One defect found: the process segfaults on exit
 
