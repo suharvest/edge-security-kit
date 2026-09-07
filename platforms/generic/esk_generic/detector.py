@@ -1,13 +1,19 @@
-"""Generic CPU detector: RTSP -> ONNX person detection -> MQTT detections.
+"""Generic CPU detector: N × RTSP -> ONNX person detection -> MQTT detections.
 
 Publishes ``sensecraft.detection/1`` and ``sensecraft.status/1`` exactly as
-specified in ``contracts/MQTT.md``, answers ``cmd/snapshot`` with raw JPEG, and
-serves the latest frame over HTTP for the hub's rule canvas.
+specified in ``contracts/MQTT.md``, answers ``cmd/snapshot`` with raw JPEG,
+answers ``cmd/control`` with ``sensecraft.ack/1``, and serves the latest frame
+of every stream over HTTP for the hub's rule canvas and video wall.
+
+``Detector`` is a supervisor. Everything genuinely shared lives here — the MQTT
+client, the ONNX session, the status heartbeat, the preview server — and one
+:class:`~esk_generic.streams.StreamWorker` per camera owns the rest. That split
+is what lets ``add_stream`` attach a camera to a running process instead of the
+operator editing a file and restarting.
 """
 
 from __future__ import annotations
 
-import collections
 import hashlib
 import json
 import logging
@@ -21,8 +27,10 @@ import numpy as np
 import paho.mqtt.client as mqtt
 
 from .config import Config
+from .control import ControlHandler, CommandError
 from .letterbox import frame_norm_to_pixels
-from .preview import SNAPSHOT_MAX_BYTES, FrameStore, encode_jpeg, start_preview_server
+from .preview import SNAPSHOT_MAX_BYTES, encode_jpeg, start_preview_server
+from .streams import OPEN_TIMEOUT_S, StreamConfig, StreamWorker
 from .tracker import IoUTracker
 from .yolo import PERSON_CLASS_NAME, PersonDetector
 
@@ -52,11 +60,7 @@ class Detector:
         self.cfg = cfg
         self.session_id = str(now_ms())
         self.started_at = time.monotonic()
-        self.frame_id = 0
-        self.stream_state = "stopped"
         self.decode_path = "sw"  # OpenCV/FFmpeg on CPU
-        self.frame_times: collections.deque[float] = collections.deque(maxlen=60)
-        self.store = FrameStore()
         self.stop_event = threading.Event()
         self.snapshot_count = 0
 
@@ -68,25 +72,161 @@ class Detector:
             intra_threads=cfg.intra_threads,
         )
         self.model_id = model_identifier(cfg.model)
-        self.tracker = IoUTracker(cfg.track_iou_threshold, cfg.track_max_lost_s)
+        # One session, many streams: the generic README documents what a second
+        # ORT thread pool costs on a shared box. The lock keeps two capture
+        # threads out of one session at once.
+        self._infer_lock = threading.Lock()
+
+        self._workers: dict[str, StreamWorker] = {}
+        self._workers_lock = threading.Lock()
 
         base = f"{cfg.topic_prefix}/{cfg.device_id}"
-        self.topic_detections = f"{base}/detections/{cfg.stream_id}"
+        self.topic_base = base
         self.topic_status = f"{base}/status"
         self.topic_snapshot = f"{base}/snapshot"
         self.topic_cmd_snapshot = f"{base}/cmd/snapshot"
+        self.topic_cmd_control = f"{base}/cmd/control"
+        self.topic_cmd_ack = f"{base}/cmd/ack"
+
+        self.control = ControlHandler(
+            cfg.device_id,
+            set_threshold=self._cmd_set_threshold,
+            add_stream=self._cmd_add_stream,
+            remove_stream=self._cmd_remove_stream,
+        )
 
         self.client = self._build_client()
         self.preview_server = None
         if cfg.preview_enabled:
             self.preview_server = start_preview_server(
-                self.store, cfg.stream_id, cfg.preview_bind, cfg.preview_port
+                self._store_for, self.stream_ids, cfg.preview_bind, cfg.preview_port
             )
             LOG.info(
-                "preview endpoint on http://%s:%d/preview.jpg (live page at /live)",
+                "preview endpoint on http://%s:%d/preview/<stream_id>.jpg "
+                "(live page at /live/<stream_id>)",
                 cfg.preview_bind,
                 cfg.preview_port,
             )
+
+        for entry in cfg.stream_configs():
+            self._create_worker(entry)
+
+    # ------------------------------------------------------------- streams
+
+    def stream_ids(self) -> list[str]:
+        with self._workers_lock:
+            return list(self._workers)
+
+    def _store_for(self, stream_id: str):
+        with self._workers_lock:
+            worker = self._workers.get(stream_id)
+        return worker.store if worker is not None else None
+
+    def _create_worker(self, entry: dict) -> StreamWorker:
+        config = StreamConfig(
+            stream_id=str(entry["stream_id"]),
+            source=str(entry["source"]),
+            name=str(entry.get("name") or ""),
+            rtsp_transport=str(entry.get("rtsp_transport") or self.cfg.rtsp_transport),
+            conf_threshold=entry.get("conf_threshold"),
+        )
+        worker = StreamWorker(
+            config=config,
+            conf_threshold=float(
+                config.conf_threshold
+                if config.conf_threshold is not None
+                else self.cfg.conf_threshold
+            ),
+            infer=self._infer,
+            publish=self._publish_detections,
+            tracker=IoUTracker(self.cfg.track_iou_threshold, self.cfg.track_max_lost_s),
+            decode_primary=self.cfg.decode_primary,
+        )
+        with self._workers_lock:
+            self._workers[worker.stream_id] = worker
+        return worker
+
+    def _infer(self, frame: np.ndarray, conf_threshold: float):
+        blob, transform = self.model.preprocess(frame)
+        with self._infer_lock:
+            raw = self.model.infer(blob)
+            inference_ms = self.model.last_inference_ms
+        return self.model.postprocess(raw, transform, conf_threshold), inference_ms
+
+    def _publish_detections(self, stream_id: str, payload: dict) -> None:
+        message = {
+            "schema": DETECTION_SCHEMA,
+            "session_id": self.session_id,
+            "device_id": self.cfg.device_id,
+            **payload,
+            "health": self.health(stream_id),
+        }
+        self.client.publish(
+            f"{self.topic_base}/detections/{stream_id}",
+            json.dumps(message),
+            qos=0,
+            retain=False,
+        )
+
+    def _persist_streams(self) -> bool:
+        with self._workers_lock:
+            entries = [w.config.to_dict() for w in self._workers.values()]
+        return self.cfg.persist_streams(entries)
+
+    # ------------------------------------------------------------- control
+
+    def _cmd_set_threshold(self, stream_id: str, value: float) -> dict:
+        with self._workers_lock:
+            worker = self._workers.get(stream_id)
+        if worker is None:
+            raise CommandError(f"no such stream: {stream_id}")
+        # In force from the next frame: the capture loop reads the attribute
+        # each time round, so nothing has to be restarted or re-entered.
+        worker.conf_threshold = value
+        worker.config.conf_threshold = value
+        persisted = self._persist_streams()
+        self.publish_status()
+        return {"stream_id": stream_id, "conf_threshold": round(value, 4),
+                "persisted": persisted}
+
+    def _cmd_add_stream(self, entry: dict) -> dict:
+        stream_id = entry["stream_id"]
+        with self._workers_lock:
+            if stream_id in self._workers:
+                raise CommandError(f"stream {stream_id} already exists")
+        worker = self._create_worker(entry)
+        worker.start()
+        # The contract says ok:true means live, so the ack waits for the source
+        # to actually open. A stream that answered "added" and then sat in
+        # reconnecting forever would put a permanently grey tile on the wall
+        # with nothing to explain it.
+        if not worker.wait_until_open(OPEN_TIMEOUT_S):
+            worker.stop()
+            with self._workers_lock:
+                self._workers.pop(stream_id, None)
+            raise CommandError(
+                worker.open_error
+                or f"source did not open within {OPEN_TIMEOUT_S:g}s: {entry['source']}"
+            )
+        persisted = self._persist_streams()
+        self.publish_status()
+        return {
+            "stream_id": stream_id,
+            "source": entry["source"],
+            "state": worker.state,
+            "conf_threshold": round(worker.conf_threshold, 4),
+            "persisted": persisted,
+        }
+
+    def _cmd_remove_stream(self, stream_id: str) -> dict:
+        with self._workers_lock:
+            worker = self._workers.pop(stream_id, None)
+        if worker is None:
+            raise CommandError(f"no such stream: {stream_id}")
+        worker.stop()
+        persisted = self._persist_streams()
+        self.publish_status()
+        return {"stream_id": stream_id, "removed": True, "persisted": persisted}
 
     # ---------------------------------------------------------------- MQTT
 
@@ -118,31 +258,48 @@ class Detector:
         if rc != 0:
             LOG.error("mqtt connect failed rc=%s", rc)
             return
-        LOG.info("mqtt connected, subscribing %s", self.topic_cmd_snapshot)
+        LOG.info("mqtt connected, subscribing %s and %s",
+                 self.topic_cmd_snapshot, self.topic_cmd_control)
         client.subscribe(self.topic_cmd_snapshot, qos=1)
+        client.subscribe(self.topic_cmd_control, qos=1)
         self.publish_status()
 
     def _on_message(self, _client, _userdata, msg: mqtt.MQTTMessage) -> None:
-        if msg.topic != self.topic_cmd_snapshot:
-            return
         try:
             request = json.loads(msg.payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            LOG.warning("bad cmd/snapshot payload: %s", exc)
+            LOG.warning("bad %s payload: %s", msg.topic, exc)
+            return
+        if msg.topic == self.topic_cmd_control:
+            self.handle_control(request)
+            return
+        if msg.topic != self.topic_cmd_snapshot:
             return
         event_id = request.get("event_id")
         stream_id = request.get("stream_id")
         if not event_id:
             LOG.warning("cmd/snapshot without event_id, ignored")
             return
-        if stream_id and stream_id != self.cfg.stream_id:
+        if stream_id and stream_id not in self.stream_ids():
             return
-        self.publish_snapshot(str(event_id))
+        self.publish_snapshot(str(event_id), stream_id)
 
-    def publish_snapshot(self, event_id: str) -> bool:
-        frame = self.store.get()
+    def handle_control(self, request: dict) -> dict | None:
+        """Apply one command and publish its ack. Returns the ack for tests."""
+        ack = self.control.handle(request, self.session_id, now_ms())
+        if ack is None:
+            return None
+        self.client.publish(self.topic_cmd_ack, json.dumps(ack), qos=1, retain=False)
+        return ack
+
+    def publish_snapshot(self, event_id: str, stream_id: str | None = None) -> bool:
+        ids = self.stream_ids()
+        target = str(stream_id) if stream_id else (ids[0] if ids else "")
+        store = self._store_for(target)
+        frame = store.get() if store is not None else None
         if frame is None:
-            LOG.warning("snapshot %s requested before the first frame", event_id)
+            LOG.warning("snapshot %s requested before the first frame of %s",
+                        event_id, target)
             return False
         payload = encode_jpeg(frame, SNAPSHOT_MAX_BYTES)
         if payload is None:
@@ -155,15 +312,23 @@ class Detector:
 
     # -------------------------------------------------------------- health
 
-    def measured_fps(self) -> float:
-        if len(self.frame_times) < 2:
-            return 0.0
-        span = self.frame_times[-1] - self.frame_times[0]
-        return 0.0 if span <= 0 else (len(self.frame_times) - 1) / span
+    def measured_fps(self, stream_id: str | None = None) -> float:
+        with self._workers_lock:
+            workers = list(self._workers.values())
+        if stream_id is not None:
+            worker = next((w for w in workers if w.stream_id == stream_id), None)
+            return worker.measured_fps() if worker else 0.0
+        return sum(w.measured_fps() for w in workers)
 
-    def health(self) -> dict:
+    def health(self, stream_id: str | None = None) -> dict:
+        """Per-stream when a stream is named, aggregate otherwise.
+
+        The detection payload carries its own stream's rate: an aggregate there
+        would report a number no single camera is running at, and the hub's
+        per-stream fps column would be wrong by the number of cameras.
+        """
         return {
-            "fps": round(self.measured_fps(), 2),
+            "fps": round(self.measured_fps(stream_id), 2),
             "decode": self.decode_path,
             "backend": self.model.backend,
             "fallback_active": self.decode_path != self.cfg.decode_primary,
@@ -187,21 +352,23 @@ class Detector:
             "online": online,
         }
         if online:
-            stream: dict = {
-                "stream_id": self.cfg.stream_id,
-                "state": self.stream_state,
-                "fps": round(self.measured_fps(), 2),
-                "decode": self.decode_path,
-            }
-            if self.cfg.preview_enabled and self.cfg.preview_advertise_host:
-                base = (
-                    f"http://{self.cfg.preview_advertise_host}:{self.cfg.preview_port}"
-                )
-                stream["preview_url"] = f"{base}/preview/{self.cfg.stream_id}.jpg"
-                # The refreshing-still page served by the same server. Without it
-                # the workbench "live view" button has no target and stays dead.
-                stream["live_url"] = f"{base}/live/{self.cfg.stream_id}"
-            payload["streams"] = [stream]
+            with self._workers_lock:
+                workers = list(self._workers.values())
+            streams = []
+            for worker in workers:
+                entry = worker.status_entry()
+                if self.cfg.preview_enabled and self.cfg.preview_advertise_host:
+                    base = (
+                        f"http://{self.cfg.preview_advertise_host}:"
+                        f"{self.cfg.preview_port}"
+                    )
+                    entry["preview_url"] = f"{base}/preview/{worker.stream_id}.jpg"
+                    # The refreshing-still page served by the same server. Without
+                    # it the workbench "live view" button and the video wall tile
+                    # have no target and stay dead.
+                    entry["live_url"] = f"{base}/live/{worker.stream_id}"
+                streams.append(entry)
+            payload["streams"] = streams
             payload["health"] = self.health()
             payload["versions"] = {"app": self.cfg.app_version, "model": self.model_id}
             payload["uptime_s"] = round(time.monotonic() - self.started_at, 1)
@@ -210,114 +377,33 @@ class Detector:
 
     # ------------------------------------------------------------ pipeline
 
-    def open_capture(self) -> cv2.VideoCapture:
-        if self.cfg.source.startswith("rtsp://"):
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                f"rtsp_transport;{self.cfg.rtsp_transport}"
-            )
-        capture = cv2.VideoCapture(self.cfg.source, cv2.CAP_FFMPEG)
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return capture
-
-    def build_detection_payload(self, frame: np.ndarray, captured_at: float) -> dict:
-        blob, transform = self.model.preprocess(frame)
-        raw = self.model.infer(blob)
-        detections = self.model.postprocess(raw, transform)
-        tracked = self.tracker.update(detections, time.monotonic())
-
-        items = []
-        for track, det in tracked:
-            x1, y1, x2, y2 = det.box
-            items.append(
-                {
-                    "track_id": track.track_id,
-                    "class": PERSON_CLASS_NAME,
-                    "score": round(det.score, 4),
-                    "bbox": [
-                        round((x1 + x2) / 2, 6),
-                        round((y1 + y2) / 2, 6),
-                        round(x2 - x1, 6),
-                        round(y2 - y1, 6),
-                    ],
-                }
-            )
-
-        self.frame_id += 1
-        height, width = frame.shape[:2]
-        return {
-            "schema": DETECTION_SCHEMA,
-            "timestamp": now_ms(),
-            "session_id": self.session_id,
-            "frame_id": self.frame_id,
-            "device_id": self.cfg.device_id,
-            "stream_id": self.cfg.stream_id,
-            "coordinate_space": "frame_norm",
-            "frame": {"w": int(width), "h": int(height)},
-            "inference_time_ms": round(self.model.last_inference_ms, 3),
-            "pipeline_ms": round((time.monotonic() - captured_at) * 1000.0, 3),
-            "detections": items,
-            "health": self.health(),
-        }
-
     def run(self, max_frames: int = 0, max_seconds: float = 0.0, annotate: str = "") -> int:
         self.client.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, self.cfg.mqtt_keepalive)
         self.client.loop_start()
 
+        with self._workers_lock:
+            workers = list(self._workers.values())
+        for worker in workers:
+            worker.start()
+
         deadline = time.monotonic() + max_seconds if max_seconds > 0 else float("inf")
-        last_status = 0.0
-        backoff = 1.0
-        capture: cv2.VideoCapture | None = None
-        published = 0
+        last_status = time.monotonic()
         annotated_written = False
         try:
             while not self.stop_event.is_set() and time.monotonic() < deadline:
-                if capture is None or not capture.isOpened():
-                    if capture is not None:
-                        capture.release()
-                    self.stream_state = "reconnecting"
-                    self.publish_status()
-                    LOG.info("opening source %s", self.cfg.source)
-                    capture = self.open_capture()
-                    if not capture.isOpened():
-                        LOG.warning("source unavailable, retrying in %.1fs", backoff)
-                        self.stop_event.wait(backoff)
-                        backoff = min(backoff * 2, 15.0)
-                        continue
-                    backoff = 1.0
-                    self.stream_state = "running"
-                    self.publish_status()
-                    last_status = time.monotonic()
-
-                captured_at = time.monotonic()
-                ok, frame = capture.read()
-                if not ok or frame is None:
-                    LOG.warning("frame read failed, reopening source")
-                    capture.release()
-                    capture = None
-                    continue
-
-                self.store.put(frame)
-                self.frame_times.append(time.monotonic())
-                payload = self.build_detection_payload(frame, captured_at)
-                self.client.publish(
-                    self.topic_detections, json.dumps(payload), qos=0, retain=False
-                )
-                published += 1
-
-                if annotate and payload["detections"] and not annotated_written:
-                    write_annotated(frame, payload, annotate)
-                    annotated_written = True
-
+                self.stop_event.wait(0.1)
                 if time.monotonic() - last_status >= self.cfg.status_interval_s:
                     self.publish_status()
                     last_status = time.monotonic()
-
-                if max_frames and published >= max_frames:
+                if annotate and not annotated_written:
+                    annotated_written = self._write_first_annotated(annotate)
+                if max_frames and self.published() >= max_frames:
                     break
         finally:
-            if capture is not None:
-                capture.release()
-            self.stream_state = "stopped"
+            with self._workers_lock:
+                workers = list(self._workers.values())
+            for worker in workers:
+                worker.stop()
             # online=False: this is a clean exit, so the LWT will not be
             # delivered and this retained payload is the last word.
             self.publish_status(online=False)
@@ -325,12 +411,49 @@ class Detector:
             self.client.loop_stop()
             if self.preview_server is not None:
                 self.preview_server.shutdown()
+        published = self.published()
         LOG.info(
-            "published %d detection messages, measured %.2f fps",
+            "published %d detection messages across %d stream(s), measured %.2f fps",
             published,
+            len(workers),
             self.measured_fps(),
         )
         return published
+
+    def published(self) -> int:
+        with self._workers_lock:
+            return sum(w.published for w in self._workers.values())
+
+    def _write_first_annotated(self, path: str) -> bool:
+        with self._workers_lock:
+            workers = list(self._workers.values())
+        for worker in workers:
+            frame = worker.store.get()
+            if frame is None:
+                continue
+            detections, _ = self._infer(frame, worker.conf_threshold)
+            if not detections:
+                continue
+            payload = {
+                "frame_id": worker.frame_id,
+                "detections": [
+                    {
+                        "track_id": 0,
+                        "class": PERSON_CLASS_NAME,
+                        "score": round(det.score, 4),
+                        "bbox": [
+                            (det.box[0] + det.box[2]) / 2,
+                            (det.box[1] + det.box[3]) / 2,
+                            det.box[2] - det.box[0],
+                            det.box[3] - det.box[1],
+                        ],
+                    }
+                    for det in detections
+                ],
+            }
+            write_annotated(frame, payload, path)
+            return True
+        return False
 
 
 def write_annotated(frame: np.ndarray, payload: dict, path: str) -> None:

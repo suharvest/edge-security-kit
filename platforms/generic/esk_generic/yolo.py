@@ -94,16 +94,29 @@ class PersonDetector:
         self.last_inference_ms = (time.perf_counter() - started) * 1000.0
         return outputs[0]
 
-    def postprocess(self, raw: np.ndarray, tf: LetterboxTransform) -> list[Detection]:
-        """Decode a (1, 4+nc, N) or (1, N, 4+nc) head into frame_norm boxes."""
+    def postprocess(
+        self,
+        raw: np.ndarray,
+        tf: LetterboxTransform,
+        conf_threshold: float | None = None,
+    ) -> list[Detection]:
+        """Decode a (1, 4+nc, N) or (1, N, 4+nc) head into frame_norm boxes.
+
+        ``conf_threshold`` overrides the session default for this call. One
+        model session is shared by every stream on the process, but the
+        threshold is a per-stream setting an operator retunes at runtime, so it
+        cannot live on the session -- setting it there would move every camera
+        when one slider moved.
+        """
         pred = np.squeeze(raw, axis=0) if raw.ndim == 3 else raw
         if pred.shape[0] < pred.shape[1]:
             pred = pred.T  # (channels, anchors) -> (anchors, channels)
         if pred.shape[1] < 5:
             return []
 
+        threshold = self.conf_threshold if conf_threshold is None else conf_threshold
         scores = pred[:, 4 + PERSON_CLASS_ID]
-        mask = scores >= self.conf_threshold
+        mask = scores >= threshold
         if not np.any(mask):
             return []
         kept, kept_scores = pred[mask, :4], scores[mask]

@@ -3,6 +3,22 @@ device_id: generic-01
 stream_id: cam-0
 
 # RTSP URL, local file, or numeric camera index as a string.
+#
+# One camera: leave `stream_id` / `source` above as they are.
+# Several: replace them with a `streams` list. The hub's "add camera" dialog
+# writes this list itself, through cmd/control, while the detector is running --
+# a camera added from the console is here after the next restart too.
+#
+#   streams:
+#     - stream_id: cam-0
+#       source: rtsp://127.0.0.1:8555/edge-sec-720p
+#     - stream_id: cam-1
+#       source: rtsp://192.168.1.64:554/Streaming/Channels/102
+#       name: North gate         # shown in the console only
+#       conf_threshold: 0.5      # overrides the process default below
+#
+# Streams share one ONNX session under a lock. Budget `intra_threads` for the
+# whole process, not per camera.
 source: rtsp://127.0.0.1:8555/edge-sec-720p
 rtsp_transport: tcp
 # The decode path this deployment treats as primary. CPU-only platform -> sw.
@@ -11,6 +27,9 @@ rtsp_transport: tcp
 decode_primary: sw
 
 model: models/yolov8n.onnx
+# Default for streams that do not set their own. The console's slider changes
+# the per-stream value at runtime and writes it back into `streams`; this key
+# stays the default for a stream added later.
 conf_threshold: 0.35
 iou_threshold: 0.45
 # ONNX Runtime intra-op thread cap. Set it. 0 means "onnxruntime default",

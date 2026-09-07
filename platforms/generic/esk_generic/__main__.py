@@ -46,6 +46,12 @@ def main(argv: list[str] | None = None) -> int:
         value = getattr(args, name, None)
         if value is not None:
             setattr(cfg, name, value)
+    if args.source is not None or args.stream_id is not None:
+        # The flags describe one stream. A config file that also carries a
+        # `streams` list would silently win over them, so the override has to
+        # collapse the list rather than sit next to it -- otherwise
+        # `--source rtsp://other` appears to do nothing.
+        cfg.streams = []
 
     detector = Detector(cfg)
     install_signal_handlers(detector)

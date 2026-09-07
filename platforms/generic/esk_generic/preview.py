@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -107,9 +108,13 @@ class _Handler(BaseHTTPRequestHandler):
     server_version = "esk-generic-preview"
     protocol_version = "HTTP/1.1"
 
-    # Injected by start_preview_server.
-    store: FrameStore
-    stream_id: str
+    # Injected by start_preview_server. ``lookup`` resolves a stream_id to its
+    # FrameStore; a detector carrying several cameras serves one endpoint per
+    # stream out of one server, and a stream added at runtime is reachable the
+    # moment the supervisor registers it -- no port to allocate, nothing to
+    # restart.
+    lookup: "Callable[[str], FrameStore | None]"
+    stream_ids: "Callable[[], list[str]]"
 
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -122,10 +127,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _live_page(self) -> None:
-        jpeg_path = f"/preview/{self.stream_id}.jpg"
+    def _live_page(self, stream_id: str) -> None:
+        jpeg_path = f"/preview/{stream_id}.jpg"
         body = LIVE_PAGE.format(
-            stream_id=self.stream_id, jpeg_path=jpeg_path, refresh_ms=LIVE_REFRESH_MS
+            stream_id=stream_id, jpeg_path=jpeg_path, refresh_ms=LIVE_REFRESH_MS
         ).encode("utf-8")
         self.send_response(200)
         self._cors()
@@ -136,8 +141,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = self.path.split("?", 1)[0]
-        if path in ("/", "/live", f"/live/{self.stream_id}"):
-            self._live_page()
+        streams = self.stream_ids()
+        default = streams[0] if streams else ""
+        if path in ("/", "/live"):
+            self._live_page(default)
+            return
+        if path.startswith("/live/"):
+            self._live_page(path[len("/live/"):])
             return
         if path in ("/healthz",):
             body = b'{"ok":true}'
@@ -148,10 +158,18 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if path not in ("/preview.jpg", f"/preview/{self.stream_id}.jpg"):
+        if path == "/preview.jpg":
+            stream_id = default
+        elif path.startswith("/preview/") and path.endswith(".jpg"):
+            stream_id = path[len("/preview/"):-len(".jpg")]
+        else:
             self.send_error(404, "no such preview")
             return
-        frame = self.store.get()
+        store = self.lookup(stream_id)
+        if store is None:
+            self.send_error(404, f"no such stream: {stream_id}")
+            return
+        frame = store.get()
         if frame is None:
             self.send_error(503, "no frame decoded yet")
             return
@@ -171,9 +189,21 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def start_preview_server(
-    store: FrameStore, stream_id: str, bind: str, port: int
+    lookup: "Callable[[str], FrameStore | None]",
+    stream_ids: "Callable[[], list[str]]",
+    bind: str,
+    port: int,
 ) -> ThreadingHTTPServer:
-    handler = type("PreviewHandler", (_Handler,), {"store": store, "stream_id": stream_id})
+    """One server for every stream the detector carries.
+
+    ``lookup`` and ``stream_ids`` are read at request time rather than captured,
+    so a stream attached by ``cmd/control`` serves frames immediately.
+    """
+    handler = type(
+        "PreviewHandler",
+        (_Handler,),
+        {"lookup": staticmethod(lookup), "stream_ids": staticmethod(stream_ids)},
+    )
     server = ThreadingHTTPServer((bind, port), handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True, name="preview").start()

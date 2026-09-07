@@ -17,11 +17,55 @@ would not need it.
 | `sensecraft/security/<device_id>/detections/<stream_id>` | `sensecraft.detection/1` | 0, no retain |
 | `sensecraft/security/<device_id>/status` | `sensecraft.status/1` | 1, retained, LWT registered at CONNECT |
 | `sensecraft/security/<device_id>/snapshot/<event_id>` | raw JPEG ≤ 200 KB | 1, no retain |
+| `sensecraft/security/<device_id>/cmd/ack` | `sensecraft.ack/1` | 1, no retain |
 
 Subscribes to `sensecraft/security/<device_id>/cmd/snapshot` and answers
 `{"stream_id": ..., "event_id": ...}` with the latest decoded frame as JPEG.
 `session_id` is the process start epoch-ms, so a restart tells the hub to drop
 its per-track state.
+
+## Several cameras in one process
+
+One process carries N streams. Each has its own capture loop, tracker, frame
+counter, preview endpoint and confidence threshold; they share the ONNX session
+under a lock, and the status message lists them all.
+
+Two things are per-stream because sharing them is a correctness bug, not an
+efficiency one. `track_id` is per-stream by contract, so one tracker across two
+cameras would hand the same id to two different people. The confidence
+threshold is what an operator retunes per camera, so a single value on the model
+session would move every camera when one slider moved.
+
+Inference is shared on purpose: a second ORT session doubles the memory and the
+thread pool, and the thread-budget section below is what that costs.
+
+## Runtime control (`cmd/control`)
+
+Subscribes to `sensecraft/security/<device_id>/cmd/control` and answers every
+command on `cmd/ack` — see contracts/MQTT.md "Control downlink" for the payload
+shapes. Three commands are implemented:
+
+| Command | Effect here |
+|---|---|
+| `set_conf_threshold` | the stream's next frame uses the new value; no restart, no reconnect |
+| `add_stream` | starts a capture loop, **waits for the source to open**, then acks |
+| `remove_stream` | stops that loop and drops it from the status message |
+
+Two properties are worth knowing before building on it:
+
+- **The ack is not sent until the change is live.** `add_stream` waits up to 6 s
+  for the source to open and acks `ok: false` with the reason if it does not.
+  Acking on receipt would be faster and would put a permanently grey tile on the
+  hub's video wall with nothing to explain it.
+- **The change is written back to the config file.** `applied.persisted` says
+  whether it was: a threshold moved from the console and lost on the next
+  restart is worse than one that could not be moved at all, because nobody
+  watches for a setting quietly reverting. A detector started from flags rather
+  than a config file has nowhere to write and reports `persisted: false`.
+
+The write is atomic (`.tmp` + `fsync` + `rename`) and drops the single-stream
+`source`/`stream_id` shorthand once a `streams` list exists, so the file never
+describes the same camera twice.
 
 ## Run
 
@@ -56,7 +100,10 @@ values on a real 720p frame.
 
 ## Preview endpoint
 
-`preview_enabled` starts a small HTTP server (default `:8099`) with two routes:
+`preview_enabled` starts one HTTP server (default `:8099`) covering every stream
+the process carries. Routes are resolved per request, so a camera attached by
+`add_stream` serves frames immediately — no port to allocate, nothing to
+restart.
 
 | Route | Serves | Advertised as |
 |---|---|---|
