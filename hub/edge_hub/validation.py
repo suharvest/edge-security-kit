@@ -26,6 +26,8 @@ SCHEMA_KINDS = {
     "sensecraft.detection/1": "detection_message",
     "sensecraft.status/1": "status_message",
     "sensecraft.event/1": "event_message",
+    "sensecraft.command/1": "command_message",
+    "sensecraft.ack/1": "ack_message",
 }
 
 

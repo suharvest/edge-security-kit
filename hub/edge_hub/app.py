@@ -21,6 +21,7 @@ from . import config as config_module
 from .alert_manager import ORIGIN_HUB, AlertManager
 from .auth import AuthManager
 from .clock import Clock
+from .control import ControlPlane
 from .device_registry import DeviceRegistry
 from .http_api import HttpApi
 from .mqtt_ingest import MqttIngest
@@ -89,6 +90,11 @@ class Hub:
             broadcaster=self.api.broadcast,
             on_session_change=self._on_session_change,
         )
+        self.control = ControlPlane(
+            self._publish,
+            topic_prefix=str(self.config["topic_prefix"]),
+            clock=self.clock,
+        )
         self.ingest: MqttIngest | None = None
         self._retention_task: asyncio.Task[None] | None = None
 
@@ -106,6 +112,7 @@ class Hub:
             on_status=self.on_status,
             on_event=self.on_event,
             on_snapshot=self.on_snapshot,
+            on_ack=self.control.on_ack,
             max_snapshot_bytes=int(self.config["max_snapshot_bytes"]),
         )
         return self.ingest
@@ -189,6 +196,7 @@ class Hub:
             "ws_clients": len(self.api.websockets),
             "suppressed_by_cooldown": self.alerts.suppressed,
             "rule_engine_drops": dict(self.engine.stats),
+            **self.control.stats(),
             **self.validator.stats(),
         }
 

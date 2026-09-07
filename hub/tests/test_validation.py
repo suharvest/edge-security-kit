@@ -119,6 +119,10 @@ def test_subscription_topics_match_the_contract():
         "sensecraft/security/+/events/+",
         "sensecraft/security/+/status",
         "sensecraft/security/+/snapshot/+",
+        # The control ack is an uplink like the other four: the hub subscribes
+        # to it, the detector publishes it. cmd/control itself is not here --
+        # the hub is that topic's publisher.
+        "sensecraft/security/+/cmd/ack",
     ]
 
 

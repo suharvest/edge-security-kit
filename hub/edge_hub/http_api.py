@@ -19,6 +19,7 @@ import aiohttp
 from aiohttp import WSMsgType, web
 
 from .auth import COOKIE_NAME, Session
+from .control import ControlRejected, ControlTimeout
 from .rules_schema import RulesError, find_rule, validate_rules_body
 
 log = logging.getLogger("edge_hub.http")
@@ -133,10 +134,18 @@ class HttpApi:
                     self.stream_preview,
                 ),
                 web.put("/devices/{device_id}/config", self.import_device_config),
+                web.put(
+                    "/devices/{device_id}/streams/{stream_id}/conf",
+                    self.set_conf_threshold,
+                ),
+                web.post("/devices/{device_id}/streams", self.add_stream),
+                web.delete("/devices/{device_id}/streams/{stream_id}", self.remove_stream),
+                web.get("/audit", self.list_audit),
                 web.get("/rules", self.all_rules),
                 web.get("/rules/{device_id}/{stream_id}", self.get_rules),
                 web.put("/rules/{device_id}/{stream_id}", self.put_rules),
                 web.post("/rules/{device_id}/{stream_id}/simulate", self.simulate),
+                web.get("/live", self.live_all),
                 web.get("/live/{device_id}/{stream_id}", self.live),
                 web.get("/config", self.get_config),
                 web.put("/config", self.put_config),
@@ -428,6 +437,119 @@ class HttpApi:
             },
         )
 
+    # -- runtime control (contracts/MQTT.md "Control downlink") -----------
+    async def _control(
+        self,
+        request: web.Request,
+        action: str,
+        command: str,
+        params: dict[str, Any],
+        device_id: str,
+        stream_id: str | None,
+        ok_status: int = 200,
+    ) -> web.Response:
+        """One command, one audit row, one HTTP answer per outcome.
+
+        The three outcomes are kept distinct all the way to the status code
+        because an operator has to act differently on each: 200 the change is
+        live, 409 the device refused and said why, 504 nothing is known about
+        the device state and the console must not redraw as if it succeeded.
+        """
+        actor = request[SESSION_KEY].username
+        now = self.hub.clock.wall_ms()
+        control = getattr(self.hub, "control", None)
+        if control is None:
+            return error("control plane unavailable", 503)
+        try:
+            applied = await control.send(device_id, command, params)
+        except ControlTimeout as exc:
+            self.hub.storage.append_audit(
+                now, actor, action, "timeout", device_id, stream_id,
+                {"params": params, "error": str(exc)},
+            )
+            return json_response({"error": str(exc), "params": params}, status=504)
+        except ControlRejected as exc:
+            self.hub.storage.append_audit(
+                now, actor, action, "rejected", device_id, stream_id,
+                {"params": params, "error": str(exc)},
+            )
+            return json_response(
+                {"error": str(exc), "params": params, "applied": exc.applied}, status=409
+            )
+        self.hub.storage.append_audit(
+            now, actor, action, "ok", device_id, stream_id,
+            {"params": params, "applied": applied},
+        )
+        return json_response({"ok": True, "applied": applied}, status=ok_status)
+
+    async def set_conf_threshold(self, request: web.Request) -> web.Response:
+        device_id = request.match_info["device_id"]
+        stream_id = request.match_info["stream_id"]
+        body = await self._json_body(request)
+        raw = body.get("conf_threshold")
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            return error("conf_threshold must be a number", 400)
+        value = float(raw)
+        if not 0.0 <= value <= 1.0:
+            return error("conf_threshold must be between 0 and 1", 400)
+        return await self._control(
+            request,
+            "set_conf_threshold",
+            "set_conf_threshold",
+            {"stream_id": stream_id, "conf_threshold": round(value, 4)},
+            device_id,
+            stream_id,
+        )
+
+    async def add_stream(self, request: web.Request) -> web.Response:
+        device_id = request.match_info["device_id"]
+        body = await self._json_body(request)
+        stream_id = str(body.get("stream_id") or "").strip()
+        source = str(body.get("source") or "").strip()
+        if not stream_id:
+            return error("stream_id is required", 400)
+        if not source:
+            return error("source is required", 400)
+        # Rejected here rather than at the detector: a stream_id collision would
+        # make two capture loops publish to one topic, and the resulting mixed
+        # frame_id sequence looks like packet loss rather than a config mistake.
+        device = next(
+            (d for d in self.hub.registry.list_devices() if d["device_id"] == device_id),
+            None,
+        )
+        if device is None:
+            return error("device not found", 404)
+        if any(str(s.get("stream_id")) == stream_id for s in device.get("streams") or []):
+            return error(f"stream {stream_id} already exists on {device_id}", 409)
+        params: dict[str, Any] = {"stream_id": stream_id, "source": source}
+        name = str(body.get("name") or "").strip()
+        if name:
+            params["name"] = name
+        transport = str(body.get("rtsp_transport") or "").strip()
+        if transport:
+            if transport not in ("tcp", "udp"):
+                return error("rtsp_transport must be tcp or udp", 400)
+            params["rtsp_transport"] = transport
+        return await self._control(
+            request, "add_stream", "add_stream", params, device_id, stream_id,
+            ok_status=201,
+        )
+
+    async def remove_stream(self, request: web.Request) -> web.Response:
+        device_id = request.match_info["device_id"]
+        stream_id = request.match_info["stream_id"]
+        return await self._control(
+            request, "remove_stream", "remove_stream", {"stream_id": stream_id},
+            device_id, stream_id,
+        )
+
+    async def list_audit(self, request: web.Request) -> web.Response:
+        rows = self.hub.storage.query_audit(
+            limit=_int(request.query.get("limit"), 100) or 100,
+            device_id=request.query.get("device_id") or None,
+        )
+        return json_response({"audit": rows, "count": len(rows)})
+
     # -- rules -----------------------------------------------------------
     async def all_rules(self, request: web.Request) -> web.Response:
         return json_response({"rules": self.hub.storage.all_rules()})
@@ -463,6 +585,13 @@ class HttpApi:
         if alert is None:
             return error("rule not found for this stream", 404)
         return json_response({"alert": alert})
+
+    async def live_all(self, request: web.Request) -> web.Response:
+        """Every stream's last detections in one response (video wall overlay)."""
+        streams = self.hub.registry.live_all()
+        return json_response(
+            {"streams": streams, "count": len(streams), "now_ms": self.hub.clock.wall_ms()}
+        )
 
     async def live(self, request: web.Request) -> web.Response:
         entry = self.hub.registry.live(

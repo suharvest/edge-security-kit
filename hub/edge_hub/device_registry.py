@@ -158,6 +158,20 @@ class DeviceRegistry:
     def live(self, device_id: str, stream_id: str) -> dict[str, Any] | None:
         return self._live.get((device_id, stream_id))
 
+    def live_all(self) -> list[dict[str, Any]]:
+        """Every stream's last detections payload, newest state, one call.
+
+        The video wall draws overlay boxes on up to nine tiles at a few hertz.
+        Nine separate ``GET /live/{d}/{s}`` round trips per tick is nine times
+        the request overhead for data that all comes out of the same in-memory
+        dict, and the tiles then disagree with each other by a request latency.
+        One call keeps the wall's boxes from the same instant.
+        """
+        return [
+            {"device_id": device_id, "stream_id": stream_id, **entry}
+            for (device_id, stream_id), entry in sorted(self._live.items())
+        ]
+
     # -- views -----------------------------------------------------------
     def list_devices(self) -> list[dict[str, Any]]:
         return [self._devices[k] for k in sorted(self._devices)]

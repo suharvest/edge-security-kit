@@ -200,9 +200,14 @@ device_registry 会另行标记）；晚到快照仍按 §3 状态机关联。�
 | PUT | /rules/{device_id}/{stream_id} | 整体替换该流 zones+lines+features+cooldown；校验通过即生效并持久化 |
 | POST | /rules/{device_id}/{stream_id}/simulate | 入参 `{rule_id}`；构造 `meta.simulated=true` 的告警走完整链路（入库、WS 推送），供画完规则后自测。**绕过冷却**（自测不该被上一条真实告警挡住），且**不发 cmd/snapshot**（没有对应真实帧），落库即 `snapshot_state=none` |
 | GET | /devices/{device_id}/config | 该设备全部流的规则+摄像头配置 JSON 导出（备份下载） |
-| PUT | /devices/{device_id}/config | 恢复上传，同 /rules 校验与持久化语义，rev 照常自增。**仅恢复规则**：契约没有摄像头配置的下行通道，导出体里的 `camera` 块是信息性的，恢复时不会推回设备（列入未来项，需要新增 `cmd/config` 下行才能闭环） |
+| PUT | /devices/{device_id}/config | 恢复上传，同 /rules 校验与持久化语义，rev 照常自增。**仅恢复规则**：导出体里的 `camera` 块是信息性的，恢复时不会推回设备。逐项推回摄像头配置走 §4 的运行时控制端点（`cmd/control`），不在这里做——批量恢复没有逐条 ack，无法回答"哪几路真的挂上了" |
 | GET | /devices/{device_id}/streams/{stream_id}/preview.jpg | **单帧预览代理**。设备的 `preview_url` 是设备本地地址（`http://127.0.0.1:8099/...`），远端浏览器取不到；hub 服务端去拉一帧 JPEG 回传，缓存 1.5 s（超时 2 s）。设备不可达 / 非 200 / 返回体不是 JPEG，一律 502 + `{"error": "...", "preview_url": "..."}`，不静默降级成灰底。流未上报 `preview_url` 时 404 |
 | GET | /live/{device_id}/{stream_id} | 该流最近一条 detections（内存态），供前端画规则时叠加参考框；无视频代理 |
+| GET | /live | 全部流的最近一条 detections，一次返回。视频墙同屏最多 9 格，每格逐个 `/live/{d}/{s}` 是 9 次往返取同一个内存 dict 里的数据，且各格画面差一个请求延迟；批量版让一屏的叠框来自同一时刻 |
+| PUT | /devices/{device_id}/streams/{stream_id}/conf | 入参 `{conf_threshold}`（0–1）。走 `cmd/control` 下行并等 ack：**200 表示检测器已经在用新阈值**，409 表示设备明确拒绝（响应带设备给的 error），504 表示没等到 ack——此时对设备状态一无所知，前端不得按成功重画。响应体 `{ok, applied}` 中的 `applied` 是设备实际生效的值，不是请求值 |
+| POST | /devices/{device_id}/streams | 入参 `{stream_id, source, name?, rtsp_transport?}`，运行时挂一路新流。成功 201。`stream_id` 与该设备已有流重名时 400/409 挡在 hub，不下发——两个采集循环发同一个 topic，症状是 frame_id 乱序，看起来像丢包而不像配置错误。设备是单流运行时会 ack `ok:false`，前端得到 409 与原因 |
+| DELETE | /devices/{device_id}/streams/{stream_id} | 摘掉一路流，语义同上 |
+| GET | /audit | 控制面操作流水（谁、何时、改了哪台设备的哪路流、从什么改成什么、设备收没收）。`outcome` 为 `ok`/`rejected`/`timeout`；失败的行比成功的行更值钱：那是"有人试图改而现场没变"的唯一证据 |
 | GET | /config | hub 自身配置（broker 地址、留存天数等） |
 | PUT | /config | 同上；重启生效项在响应中列出 |
 | POST | /auth/login | 入参用户名+密码；成功签发 HttpOnly+SameSite=Strict 会话 cookie，无鉴权 |
@@ -413,6 +418,13 @@ RSS < 300 MB、SQLite 写放大可忽略（仅事件落库）。镜像目标 < 1
 维持长连接、按帧率持续拉取并向前端扇出；单帧代理是一次请求取一帧、带缓存、无状态。
 前者让 hub 的资源占用随流数和观看人数增长，后者不会。禁止在此基础上加 MJPEG
 multipart、HLS 切片、WebRTC 转发或任何"顺手做成连续的"变体。
+
+**视频墙（FRONTEND_SPEC §9）不越这条线**，理由是流量根本不经过 hub：每格的实时
+画面由浏览器直连设备侧的 `live_url`（go2rtc WebRTC 或设备自带的刷新静帧），
+hub 只在 `/devices` 里把这个地址透传出去。hub 承担的仍然只有两件事——每格的叠框
+JSON（`GET /live`，一次请求覆盖全屏）和离线格回落的单帧代理。9 格墙对 hub 的成本
+是每秒几个 JSON 请求，与观看人数无关；把画面改成经 hub 转发，成本立刻变成
+路数 × 人数，那就是上面禁止的那件事。
 
 **无批量删除端点**：没有 `DELETE /alerts`、没有"清空全部事件"。告警是取证记录，
 清理由 §6 的留存策略按天自动做；一个能一次抹掉全部证据的端点，对合法用户省下

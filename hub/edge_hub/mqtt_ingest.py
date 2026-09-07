@@ -21,6 +21,7 @@ DETECTIONS = "detections"
 EVENTS = "events"
 STATUS = "status"
 SNAPSHOT = "snapshot"
+ACK = "cmd/ack"
 
 
 class MqttIngest:
@@ -37,6 +38,7 @@ class MqttIngest:
         on_status: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_snapshot: Callable[[str, str, bytes], Awaitable[None]] | None = None,
+        on_ack: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         max_snapshot_bytes: int = 200 * 1024,
     ) -> None:
         self.host = host
@@ -52,6 +54,7 @@ class MqttIngest:
         self.on_status = on_status
         self.on_event = on_event
         self.on_snapshot = on_snapshot
+        self.on_ack = on_ack
         self.max_snapshot_bytes = max_snapshot_bytes
         self.connected = False
         self.messages = 0
@@ -69,6 +72,7 @@ class MqttIngest:
             f"{p}/+/{EVENTS}/+",
             f"{p}/+/{STATUS}",
             f"{p}/+/{SNAPSHOT}/+",
+            f"{p}/+/{ACK}",
         ]
 
     # -- lifecycle -------------------------------------------------------
@@ -159,6 +163,18 @@ class MqttIngest:
             self.validator.failures["unknown_topic"] += 1
             return
         device_id, kind, tail = parts
+
+        if kind == "cmd" and tail == "ack":
+            message = self.validator.validate(payload, expected="sensecraft.ack/1")
+            if message is None:
+                log.debug("rejected %s: %s", topic, self.validator.last_error)
+                return
+            if str(message.get("device_id")) != device_id:
+                self.validator.failures["device_id_topic_mismatch"] += 1
+                return
+            if self.on_ack is not None:
+                await self.on_ack(message)
+            return
 
         if kind == SNAPSHOT:
             if tail is None:

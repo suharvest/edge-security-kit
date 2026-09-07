@@ -88,6 +88,23 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_ms  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_ms);
+
+-- Runtime control is the one class of change that leaves no other trace: a
+-- confidence threshold moved from the console changes what the site detects,
+-- and afterwards the config file, the alert history and the device status all
+-- read as if it had always been that way. Who moved it, from what, to what, and
+-- whether the device took it -- that only exists if it is written down here.
+CREATE TABLE IF NOT EXISTS audit (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_ms      INTEGER NOT NULL,
+  actor      TEXT NOT NULL,
+  action     TEXT NOT NULL,
+  device_id  TEXT,
+  stream_id  TEXT,
+  outcome    TEXT NOT NULL CHECK(outcome IN ('ok','rejected','timeout')),
+  detail     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts_ms DESC);
 """
 
 #: HUB_SPEC §4: config_versions keeps the most recent 50 revisions per scope.
@@ -612,6 +629,50 @@ class Storage:
     def count_sessions(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()
         return int(row["n"])
+
+    # -- audit -----------------------------------------------------------
+    def append_audit(
+        self,
+        ts_ms: int,
+        actor: str,
+        action: str,
+        outcome: str,
+        device_id: str | None = None,
+        stream_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> int:
+        """Record one control-plane attempt. Failures are recorded too.
+
+        A rejected or timed-out command is the more interesting row of the two:
+        it is the evidence that an operator tried to change something and the
+        site did not change.
+        """
+        cur = self.conn.execute(
+            """INSERT INTO audit (ts_ms, actor, action, device_id, stream_id, outcome, detail)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (ts_ms, actor, action, device_id, stream_id, outcome,
+             json.dumps(detail or {}, ensure_ascii=False)),
+        )
+        return int(cur.lastrowid or 0)
+
+    def query_audit(self, limit: int = 100, device_id: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM audit"
+        params: list[Any] = []
+        if device_id:
+            sql += " WHERE device_id = ?"
+            params.append(device_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        rows = self.conn.execute(sql, params).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["detail"] = json.loads(item["detail"] or "{}")
+            except json.JSONDecodeError:
+                item["detail"] = {}
+            out.append(item)
+        return out
 
     # -- retention -------------------------------------------------------
     def purge_older_than(self, cutoff_ms: int) -> int:
