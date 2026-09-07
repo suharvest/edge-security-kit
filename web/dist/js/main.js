@@ -8,6 +8,7 @@ import { TopBar } from './components/topbar.js';
 import { Toasts } from './components/ui.js';
 import { AlertsPage } from './pages/alerts.js';
 import { DevicesPage } from './pages/devices.js';
+import { WallPage } from './pages/wall.js';
 import { RulesPage } from './pages/rules.js';
 import { LoginPage } from './pages/login.js';
 import { DebugPage } from './pages/debug.js';
@@ -90,7 +91,8 @@ function App() {
   if (path === '/login' || !st.session.user) {
     return html`<div class="app"><${LoginPage} /><${Toasts} /></div>`;
   }
-  const page = path === '/devices' ? html`<${DevicesPage} />`
+  const page = path === '/wall' ? html`<${WallPage} />`
+    : path === '/devices' ? html`<${DevicesPage} />`
     : path === '/rules' ? html`<${RulesPage} />`
       : path === '/debug' ? html`<${DebugPage} />`
         : html`<${AlertsPage} />`;

@@ -84,6 +84,18 @@ export const api = {
   streamPreviewUrl: (id, sid) =>
     BASE + '/devices/' + encodeURIComponent(id) + '/streams/' + encodeURIComponent(sid) + '/preview.jpg',
 
+  // Runtime control (contracts/MQTT.md "Control downlink"). All three answer
+  // 200 only when the detector confirmed the change is live; 409 is a refusal
+  // with the device's own reason, 504 means the ack never arrived and the
+  // caller must not redraw as if it had succeeded.
+  setConfThreshold: (d, s, conf_threshold) =>
+    req('PUT', '/devices/' + encodeURIComponent(d) + '/streams/' + encodeURIComponent(s) + '/conf',
+      { conf_threshold }),
+  addStream: (d, body) => req('POST', '/devices/' + encodeURIComponent(d) + '/streams', body),
+  removeStream: (d, s) =>
+    req('DELETE', '/devices/' + encodeURIComponent(d) + '/streams/' + encodeURIComponent(s)),
+  audit: (params) => req('GET', '/audit' + qs(params)),
+
   rules: () => req('GET', '/rules'),
   streamRules: (d, s) => req('GET', '/rules/' + encodeURIComponent(d) + '/' + encodeURIComponent(s)),
   putStreamRules: (d, s, body) => req('PUT', '/rules/' + encodeURIComponent(d) + '/' + encodeURIComponent(s), body),
@@ -91,6 +103,9 @@ export const api = {
     req('POST', '/rules/' + encodeURIComponent(d) + '/' + encodeURIComponent(s) + '/simulate', { rule_id }),
 
   live: (d, s) => req('GET', '/live/' + encodeURIComponent(d) + '/' + encodeURIComponent(s)),
+  // Batch form for the video wall: one request covers every tile, so a
+  // screenful of overlay boxes comes from the same instant.
+  liveAll: () => req('GET', '/live'),
 
   config: () => req('GET', '/config'),
   putConfig: (body) => req('PUT', '/config', body),

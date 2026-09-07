@@ -61,19 +61,21 @@ const devices = [
     // objects, each carrying its own stream_id. The hub passes it through as-is.
     streams: [
       {
-        stream_id: 'cam-01',
+        stream_id: 'cam-01', name: 'Gate A',
+        conf_threshold: 0.35,
         state: 'running', decode: 'hw', fps: 14.8, fallback_active: false,
         frame: { w: 1920, h: 1080 },
         preview_url: '/mock/preview-1920x1080.jpg',
-        live_url: 'http://192.168.3.31:8080/live/cam-01',
+        live_url: '/mock/live/cam-01',
       },
       // 4:3 source on a 16:9 canvas: proves the object-fit: contain math (§4.1).
       {
-        stream_id: 'cam-02',
+        stream_id: 'cam-02', name: 'Loading bay',
+        conf_threshold: 0.45,
         state: 'running', decode: 'hw', fps: 13.2, fallback_active: false,
         frame: { w: 1280, h: 960 },
         preview_url: '/mock/preview-1280x960.jpg',
-        live_url: 'http://192.168.3.31:8080/live/cam-02',
+        live_url: '/mock/live/cam-02',
       },
     ],
   },
@@ -87,10 +89,11 @@ const devices = [
     streams: [
       // No preview_url -> grey canvas fallback + /api/live overlay.
       {
-        stream_id: 'cam-01',
+        stream_id: 'cam-01', name: 'Dock ramp',
+        conf_threshold: 0.5,
         state: 'running', decode: 'sw', fps: 6.2, fallback_active: true,
         frame: { w: 2560, h: 1440 },
-        live_url: 'http://192.168.3.42:8080/live/cam-01',
+        live_url: '/mock/live/rk-cam-01',
       },
     ],
   },
@@ -102,7 +105,7 @@ const devices = [
     versions: { app: '0.1.9', model: 'yolo11n@0c31a7d19f42' },
     last_seen_ms: Date.now() - 52 * 60 * 1000,
     streams: [
-      { stream_id: 'cam-01', state: 'stopped', decode: 'hw', fps: 0, frame: { w: 1920, h: 1080 } },
+      { stream_id: 'cam-01', name: 'Side door', conf_threshold: 0.4, state: 'stopped', decode: 'hw', fps: 0, frame: { w: 1920, h: 1080 } },
     ],
   },
 ];
@@ -139,6 +142,66 @@ function streamOf(dev, sid) {
   return (dev && dev.streams || []).find((x) => String(x.stream_id) === String(sid)) || null;
 }
 function streamIdsOf(dev) { return (dev && dev.streams || []).map((x) => String(x.stream_id)); }
+
+// The hub answers /live and /live/{d}/{s} with {received_ms, payload}, where
+// payload is the detector's own sensecraft.detection/1 message. The mock once
+// answered a flat {objects: [...]} instead; the rule editor was written against
+// that and its reference boxes therefore never drew against a real hub. Both
+// mock routes now build the payload here, so there is one shape to get wrong.
+let liveFrameId = 0;
+function liveEntry(dev, stream) {
+  // Deterministic motion rather than random boxes: a screenshot or a GIF then
+  // shows people walking rather than boxes teleporting, and two consecutive
+  // frames are comparable.
+  const t = Date.now() / 1000;
+  const seed = (String(dev.device_id) + String(stream.stream_id))
+    .split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) % 997, 7);
+  const n = 1 + (seed % 3);
+  const detections = [];
+  for (let i = 0; i < n; i++) {
+    const phase = t * 0.11 + (seed + i * 37) / 40;
+    const cx = 0.2 + 0.6 * (0.5 + 0.5 * Math.sin(phase));
+    const cy = 0.42 + 0.22 * Math.sin(phase * 0.7 + i);
+    detections.push({
+      track_id: i + 1,
+      class: 'person',
+      score: Number((0.62 + 0.3 * Math.abs(Math.sin(phase * 1.7))).toFixed(2)),
+      bbox: [Number(cx.toFixed(4)), Number(cy.toFixed(4)), 0.09, 0.26],
+    });
+  }
+  liveFrameId += 1;
+  return {
+    device_id: dev.device_id,
+    stream_id: String(stream.stream_id),
+    received_ms: Date.now(),
+    payload: {
+      schema: 'sensecraft.detection/1',
+      timestamp: Date.now(),
+      session_id: 'mock-1',
+      frame_id: liveFrameId,
+      device_id: dev.device_id,
+      stream_id: String(stream.stream_id),
+      coordinate_space: 'frame_norm',
+      frame: stream.frame || { w: 1280, h: 720 },
+      inference_time_ms: 4.2,
+      detections,
+      health: { fps: stream.fps || 0, decode: stream.decode || 'hw',
+                backend: 'mock', fallback_active: !!stream.fallback_active },
+    },
+  };
+}
+
+// Audit trail, written by the control endpoints below.
+const auditRows = [];
+let auditSeq = 0;
+function audit(actor, action, device_id, stream_id, outcome, detail) {
+  auditSeq += 1;
+  auditRows.unshift({ id: auditSeq, ts_ms: Date.now(), actor, action,
+                      device_id, stream_id, outcome, detail });
+  return auditRows[0];
+}
+// Scenario knobs: /mock/control?mode=timeout|refuse|ok
+let controlMode = 'ok';
 
 function ruleNamesFor(d, s) { return (RULES[d] && RULES[d][s]) || ['rule']; }
 
@@ -333,7 +396,7 @@ function serveFile(res, file, fallbackType) {
   });
 }
 
-const SPA_ROUTES = ['/', '/login', '/devices', '/rules', '/debug'];
+const SPA_ROUTES = ['/', '/login', '/wall', '/devices', '/rules', '/debug'];
 
 // ---------------------------------------------------------------- scenario knobs
 
@@ -583,27 +646,103 @@ async function api(req, res, u) {
     return send(res, 200, { ok: true, alert_id: a.id });
   }
 
+  if (p === '/live' && method === 'GET') {
+    const streams = [];
+    devices.forEach((dev) => {
+      if (!dev.online) return;
+      (dev.streams || []).forEach((st) => {
+        if (st.state !== 'running') return;
+        streams.push(liveEntry(dev, st));
+      });
+    });
+    return send(res, 200, { streams, count: streams.length, now_ms: Date.now() });
+  }
+
   m = /^\/live\/([^/]+)\/([^/]+)$/.exec(p);
   if (m && method === 'GET') {
     const d = decodeURIComponent(m[1]);
-    const s = decodeURIComponent(m[2]);
+    const sid = decodeURIComponent(m[2]);
     const dev = devices.find((x) => x.device_id === d);
-    const stream = streamOf(dev, s);
+    const stream = streamOf(dev, sid);
     if (!stream) return send(res, 404, { error: 'no such stream' });
-    const n = 1 + Math.floor(Math.random() * 3);
-    const objects = [];
-    for (let i = 0; i < n; i++) {
-      objects.push({
-        label: 'person',
-        track_id: i + 1,
-        score: Number((0.6 + Math.random() * 0.35).toFixed(2)),
-        bbox: [Number((0.15 + Math.random() * 0.7).toFixed(3)), Number((0.3 + Math.random() * 0.5).toFixed(3)), 0.1, 0.26],
-      });
+    return send(res, 200, liveEntry(dev, stream));
+  }
+
+  // ---- runtime control (contracts/MQTT.md "Control downlink") --------------
+  // The three outcomes are what the console has to render differently, so the
+  // mock can produce all three: /mock/control?mode=timeout|refuse|ok.
+  function controlOutcome(action, device_id, stream_id, params, applied) {
+    if (controlMode === 'timeout') {
+      audit('operator', action, device_id, stream_id, 'timeout', { params });
+      return send(res, 504, { error: device_id + ' did not answer ' + action + ' within 8s', params });
     }
-    return send(res, 200, {
-      device_id: d, stream_id: s, coordinate_space: 'frame_norm',
-      timestamp: Date.now(), frame: stream.frame, objects,
-    });
+    if (controlMode === 'refuse') {
+      audit('operator', action, device_id, stream_id, 'rejected', { params });
+      return send(res, 409, { error: 'device refused: single-stream runtime', params, applied: {} });
+    }
+    audit('operator', action, device_id, stream_id, 'ok', { params, applied });
+    return send(res, action === 'add_stream' ? 201 : 200, { ok: true, applied });
+  }
+
+  m = /^\/devices\/([^/]+)\/streams\/([^/]+)\/conf$/.exec(p);
+  if (m && method === 'PUT') {
+    const d = decodeURIComponent(m[1]);
+    const sid = decodeURIComponent(m[2]);
+    const b = await readBody(req);
+    const v = b && b.conf_threshold;
+    if (typeof v !== 'number' || v < 0 || v > 1) return send(res, 400, { error: 'conf_threshold must be between 0 and 1' });
+    const dev = devices.find((x) => x.device_id === d);
+    const stream = streamOf(dev, sid);
+    if (!stream) return send(res, 404, { error: 'no such stream' });
+    const applied = { stream_id: sid, conf_threshold: v, persisted: true };
+    if (controlMode === 'ok') {
+      stream.conf_threshold = v;
+      push({ type: 'device.status', device: dev });
+    }
+    return controlOutcome('set_conf_threshold', d, sid, { stream_id: sid, conf_threshold: v }, applied);
+  }
+
+  m = /^\/devices\/([^/]+)\/streams$/.exec(p);
+  if (m && method === 'POST') {
+    const d = decodeURIComponent(m[1]);
+    const dev = devices.find((x) => x.device_id === d);
+    if (!dev) return send(res, 404, { error: 'device not found' });
+    const b = await readBody(req) || {};
+    if (!b.stream_id) return send(res, 400, { error: 'stream_id is required' });
+    if (!b.source) return send(res, 400, { error: 'source is required' });
+    if (streamIdsOf(dev).includes(String(b.stream_id))) {
+      return send(res, 409, { error: 'stream ' + b.stream_id + ' already exists on ' + d });
+    }
+    const applied = { stream_id: b.stream_id, source: b.source, state: 'running', persisted: true };
+    if (controlMode === 'ok') {
+      dev.streams.push({
+        stream_id: String(b.stream_id), name: b.name || '',
+        state: 'running', decode: 'hw', fps: 12.0, fallback_active: false,
+        conf_threshold: 0.35, frame: { w: 1920, h: 1080 },
+        preview_url: '/mock/preview-1920x1080.jpg',
+        live_url: '/mock/live/' + String(b.stream_id),
+      });
+      push({ type: 'device.status', device: dev });
+    }
+    return controlOutcome('add_stream', d, String(b.stream_id), b, applied);
+  }
+
+  m = /^\/devices\/([^/]+)\/streams\/([^/]+)$/.exec(p);
+  if (m && method === 'DELETE') {
+    const d = decodeURIComponent(m[1]);
+    const sid = decodeURIComponent(m[2]);
+    const dev = devices.find((x) => x.device_id === d);
+    if (!dev || !streamOf(dev, sid)) return send(res, 404, { error: 'no such stream' });
+    if (controlMode === 'ok') {
+      dev.streams = dev.streams.filter((x) => String(x.stream_id) !== sid);
+      push({ type: 'device.status', device: dev });
+    }
+    return controlOutcome('remove_stream', d, sid, { stream_id: sid }, { stream_id: sid, removed: true, persisted: true });
+  }
+
+  if (p === '/audit' && method === 'GET') {
+    const limit = Number(u.query.limit || 100);
+    return send(res, 200, { audit: auditRows.slice(0, limit), count: Math.min(auditRows.length, limit) });
   }
 
   if (p === '/config') {
@@ -621,6 +760,24 @@ async function api(req, res, u) {
 function mock(req, res, u) {
   const q = u.query;
   const p = u.pathname;
+  const m = /^\/mock\/live\/([^/]+)$/.exec(p);
+  if (m) {
+    // The detector's own /live page is a refreshing still (platforms/generic
+    // preview.py). The mock serves the same shape so the wall exercises the
+    // iframe path rather than only the hub's single-frame proxy.
+    const sid = decodeURIComponent(m[1]);
+    const jpeg = sid === 'cam-02' ? '/mock/preview-1280x960.jpg' : '/mock/preview-1920x1080.jpg';
+    const body = '<!doctype html><meta charset="utf-8"><style>html,body{margin:0;height:100%;background:#06080b}'
+      + 'img{width:100%;height:100%;object-fit:fill;display:block}</style>'
+      + '<img id="f" alt="' + sid + '"><script>var i=document.getElementById("f");'
+      + 'function t(){i.src="' + jpeg + '?t="+Date.now();}t();setInterval(t,1000);<\/script>';
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    return res.end(body);
+  }
+  if (p === '/mock/control') {
+    controlMode = ['ok', 'refuse', 'timeout'].includes(q.mode) ? q.mode : 'ok';
+    return send(res, 200, { control_mode: controlMode });
+  }
   if (p === '/mock/burst') {
     const n = Number(q.n || 1);
     const made = [];

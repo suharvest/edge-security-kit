@@ -99,6 +99,18 @@ export function errMsg(e) {
 // (device_registry.py). Treating it as an object keyed by stream id yields array
 // indices ("0", "1", ...) as stream ids, which silently writes rules to a stream
 // named "0". Every consumer goes through these helpers.
+// GET /api/live and /api/live/{d}/{s} both answer {received_ms, payload}, where
+// payload is the detector's own sensecraft.detection/1 message. Reading it in
+// one place is what stops a second consumer inventing a third shape: the rule
+// editor was written against the mock hub's `objects` array, which the real hub
+// has never sent, so its reference boxes never appeared against a real device.
+export function liveDetections(entry) {
+  if (!entry) return [];
+  const payload = entry.payload || entry;
+  const list = payload.detections || payload.objects;
+  return Array.isArray(list) ? list : [];
+}
+
 export function streamList(device) {
   const s = (device && device.streams) || [];
   if (Array.isArray(s)) return s.filter((x) => x && x.stream_id != null);

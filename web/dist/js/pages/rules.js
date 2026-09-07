@@ -8,7 +8,7 @@ import { useStore, commit, toast } from '../store.js';
 import { setQuery } from '../router.js';
 import { Icon } from '../icons.js';
 import { Field, Select, Confirm, Spinner } from '../components/ui.js';
-import { clockTime, uid, errMsg, streamIds, findStream } from '../util.js';
+import { clockTime, uid, errMsg, streamIds, findStream, liveDetections } from '../util.js';
 import {
   computeFit, normToCanvas, canvasToNorm, eventToCanvas, forwardNormal, midpoint,
   distToSegment, pointInPolygon, isSelfIntersecting, polygonCentroid, bboxToRect, clamp01,
@@ -290,7 +290,7 @@ function RuleCanvas({ body, setBody, frame, previewSources, live, showLive, tool
     : tool === 'line' ? t('rules.tool.lineHint')
       : tool === 'delete' ? t('rules.tool.deleteHint') : '';
 
-  const liveBoxes = showLive && live && Array.isArray(live.objects) ? live.objects : [];
+  const liveBoxes = showLive ? liveDetections(live) : [];
 
   return html`
     <div class="canvas-col">

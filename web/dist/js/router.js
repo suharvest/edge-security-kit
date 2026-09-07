@@ -4,7 +4,7 @@
 // so deep links still work.
 import { getState, commit } from './store.js';
 
-export const ROUTES = ['/', '/login', '/devices', '/rules', '/debug'];
+export const ROUTES = ['/', '/login', '/wall', '/devices', '/rules', '/debug'];
 
 let hashMode = false;
 

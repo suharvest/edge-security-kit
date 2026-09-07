@@ -1,7 +1,8 @@
 # hub frontend
 
-Implements `docs/FRONTEND_SPEC.md` P1 (login, alert workbench, rule editor) plus the P2
-devices page. The device-local debug page (`§6`) is a placeholder route.
+Implements `docs/FRONTEND_SPEC.md` P1 (login, alert workbench, rule editor), the P2
+devices page and the §10 video wall. The device-local debug page (`§6`) is a placeholder
+route.
 
 ## Layout
 
@@ -16,6 +17,7 @@ web/
 ├── mock-server.js            dependency-free mock hub for development (HUB_SPEC §4 subset + /ws)
 ├── mock/                     fixture JPEGs used by the mock hub only
 ├── tools/check-i18n.js       zh/en dictionary parity + missing-key check
+├── tools/test-wall.mjs       §10 wall layout / overlay / slider / add-camera unit tests
 ├── tools/test-coords.mjs     FRONTEND_SPEC §4.1 / MQTT.md direction unit tests
 ├── tools/check-streams-shape.mjs  device.streams array shape: contract fixture == mock == frontend
 └── screenshots/              verification screenshots
@@ -61,6 +63,11 @@ Tolerated shapes, so the hub has latitude:
   `{error, issues: [{target_type, target_id, name, message}]}` — with `issues` the editor
   flags the offending zone/line in the sidebar, without it the single `error` string is
   shown verbatim.
+- `GET /live` and `GET /live/{d}/{s}` both answer `{received_ms, payload}` where `payload`
+  is the detector's `sensecraft.detection/1` message. The mock once answered a flat
+  `{objects: [...]}`, the rule editor was written against that, and its reference boxes
+  therefore never appeared against a real hub. `util.js` `liveDetections()` is now the one
+  reader, and the mock builds the payload in one place.
 - `rule_name` is sent as a `/alerts` and `/alerts/export.csv` filter parameter even though
   HUB_SPEC §4 does not list it; the list is additionally filtered client-side, so a hub
   that ignores the parameter still behaves correctly (CSV export cannot be filtered
@@ -86,6 +93,7 @@ Scenario controls (dev only, unauthenticated):
 | `/mock/decode?device=ID&stream=ID&decode=sw` | flip decode health |
 | `/mock/reject?on=1` | `PUT /api/rules` answers `400` with per-item issues |
 | `/mock/fail?on=1` | `PUT /api/rules` answers `503` (network-class failure) |
+| `/mock/control?mode=ok\|refuse\|timeout` | which of the three control outcomes `PUT .../conf`, `POST .../streams` and `DELETE .../streams/{id}` produce |
 | `/mock/state` | counters, WS client count, knob state |
 
 Fixtures include a 4:3 stream (`jetson-01/cam-02`, 1280×960) so the letterbox coordinate
@@ -98,6 +106,7 @@ canvas fallback.
 node web/tools/check-i18n.js     # dictionary parity, missing keys, dynamic prefixes
 node web/tools/test-coords.mjs   # §4.1 fit/round-trip/clamp + forward-direction convention
 node web/tools/check-streams-shape.mjs   # device.streams is an array everywhere
+node web/tools/test-wall.mjs     # §10 grid, overlay staleness, conf clamping, source masking
 ```
 
 `check-streams-shape.mjs` exists because the mock hub once modelled `streams` as an

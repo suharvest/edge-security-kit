@@ -54,6 +54,7 @@ export function TopBar() {
       <div class="brand">${Icon.shield({ size: 18 })}<span>${t('app.title')}</span></div>
       <nav class="tabs">
         ${tab('/', t('nav.alerts'), pending)}
+        ${tab('/wall', t('nav.wall'), 0)}
         ${tab('/devices', t('nav.devices'), swCount)}
         ${tab('/rules', t('nav.rules'), 0)}
       </nav>
