@@ -507,14 +507,27 @@ class HailoPersonDetector:
                 )
         self._range_checked = True
 
-    def detect(self, rgb_canvas: np.ndarray, tf: LetterboxTransform) -> list[Detection]:
+    def detect(
+        self,
+        rgb_canvas: np.ndarray,
+        tf: LetterboxTransform,
+        conf_threshold: float | None = None,
+    ) -> list[Detection]:
+        """Detect people in one letterboxed canvas.
+
+        ``conf_threshold`` overrides the session default for this call. One
+        model serves every stream on the process, but the threshold is a
+        per-stream setting an operator retunes at runtime, so it cannot live on
+        the session -- setting it there moves every camera when one slider does.
+        """
+        threshold = self.conf_threshold if conf_threshold is None else conf_threshold
         outputs = self.infer(rgb_canvas)
         if not self._range_checked:
             self._check_class_range(outputs)
         return decode_split_head(
             outputs,
             tf,
-            self.conf_threshold,
+            threshold,
             self.iou_threshold,
             self.input_size,
             quants=self.quants,

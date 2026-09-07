@@ -310,11 +310,24 @@ class TRTPersonDetector:
         self.last_inference_ms = float(elapsed) if int(err) == 0 else 0.0
         return self.output_host
 
-    def detect(self, rgb_canvas: np.ndarray, tf: LetterboxTransform) -> list[Detection]:
+    def detect(
+        self,
+        rgb_canvas: np.ndarray,
+        tf: LetterboxTransform,
+        conf_threshold: float | None = None,
+    ) -> list[Detection]:
+        """Detect people in one letterboxed canvas.
+
+        ``conf_threshold`` overrides the session default for this call. One
+        model serves every stream on the process, but the threshold is a
+        per-stream setting an operator retunes at runtime, so it cannot live on
+        the session -- setting it there moves every camera when one slider does.
+        """
+        threshold = self.conf_threshold if conf_threshold is None else conf_threshold
         self.preprocess_into(rgb_canvas)
         raw = self.infer()
         return decode_person_head(
-            raw.astype(np.float32, copy=False), tf, self.conf_threshold, self.iou_threshold
+            raw.astype(np.float32, copy=False), tf, threshold, self.iou_threshold
         )
 
     def close(self) -> None:

@@ -108,8 +108,12 @@ class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # Injected by start_preview_server.
-    store: FrameStore
-    stream_id: str
+    # ``lookup`` resolves a stream_id to that stream's latest frame; a detector
+    # carrying several cameras serves one endpoint per stream from one server,
+    # and a stream added at runtime is reachable the moment the supervisor
+    # registers it -- no port to allocate, nothing to restart.
+    lookup: object
+    stream_ids: object
 
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -122,10 +126,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _live_page(self) -> None:
-        jpeg_path = f"/preview/{self.stream_id}.jpg"
+    def _live_page(self, stream_id: str) -> None:
+        jpeg_path = f"/preview/{stream_id}.jpg"
         body = LIVE_PAGE.format(
-            stream_id=self.stream_id, jpeg_path=jpeg_path, refresh_ms=LIVE_REFRESH_MS
+            stream_id=stream_id, jpeg_path=jpeg_path, refresh_ms=LIVE_REFRESH_MS
         ).encode("utf-8")
         self.send_response(200)
         self._cors()
@@ -136,8 +140,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = self.path.split("?", 1)[0]
-        if path in ("/", "/live", f"/live/{self.stream_id}"):
-            self._live_page()
+        streams = self.stream_ids()
+        default = streams[0] if streams else ""
+        if path in ("/", "/live"):
+            self._live_page(default)
+            return
+        if path.startswith("/live/"):
+            self._live_page(path[len("/live/"):])
             return
         if path in ("/healthz",):
             body = b'{"ok":true}'
@@ -148,10 +157,17 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if path not in ("/preview.jpg", f"/preview/{self.stream_id}.jpg"):
+        if path == "/preview.jpg":
+            stream_id = default
+        elif path.startswith("/preview/") and path.endswith(".jpg"):
+            stream_id = path[len("/preview/"):-len(".jpg")]
+        else:
             self.send_error(404, "no such preview")
             return
-        frame = self.store.get()
+        frame = self.lookup(stream_id)
+        if frame is None and stream_id not in streams:
+            self.send_error(404, f"no such stream: {stream_id}")
+            return
         if frame is None:
             self.send_error(503, "no frame decoded yet")
             return

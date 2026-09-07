@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Any
+
+from esk_core import config_streams
 
 
 @dataclass
@@ -19,6 +21,11 @@ class Config:
     # Identity -- both are also embedded in every payload (MQTT.md).
     device_id: str = "rpi5-hailo8-01"
     stream_id: str = "cam-0"
+
+    # Source. `streams` is the multi-stream form; `stream_id`/`source` below are
+    # the single-stream shorthand every existing config file uses and are folded
+    # into `streams` at load time, so no deployment needs editing.
+    streams: list[dict[str, Any]] = field(default_factory=list)
 
     # Source
     source: str = "rtsp://127.0.0.1:8557/edge-sec-truth"
@@ -62,6 +69,15 @@ class Config:
 
     app_version: str = "0.1.0"
 
+    #: Where this config was loaded from. Runtime changes are written back here
+    #: so a threshold moved from the console survives a restart; None means the
+    #: process was configured from flags and nothing is persisted.
+    path: str | None = None
+    #: Upper bound on streams in this process, 0 = no limit. The boards have a
+    #: measured knee (see the top-level README's multi-stream ladder); refusing
+    #: past it is kinder than accepting and degrading every existing stream.
+    max_streams: int = 0
+
     @classmethod
     def load(cls, path: str | None) -> "Config":
         data: dict[str, Any] = {}
@@ -75,10 +91,20 @@ class Config:
 
                 data = yaml.safe_load(text) or {}
         known = {f.name for f in fields(cls)}
+        data.pop("path", None)  # not an operator-settable key
         unknown = set(data) - known
         if unknown:
             raise ValueError(f"unknown config keys: {sorted(unknown)}")
         cfg = cls(**data)
+        cfg.path = path
         if path and not os.path.isabs(cfg.model):
             cfg.model = os.path.join(os.path.dirname(os.path.abspath(path)), cfg.model)
         return cfg
+
+    def stream_configs(self) -> list[dict[str, Any]]:
+        """The stream list, whichever form the file used."""
+        return config_streams.stream_configs(self)
+
+    def persist_streams(self, streams: list[dict[str, Any]]) -> bool:
+        """Write the current stream list back, atomically. See esk_core."""
+        return config_streams.persist_streams(self, streams)

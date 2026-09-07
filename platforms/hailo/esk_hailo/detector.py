@@ -30,9 +30,12 @@ import cv2
 import numpy as np
 import paho.mqtt.client as mqtt
 
+from esk_core import StreamSupervisor
+
+from .backend import HailoBackend
 from .config import Config
 from .letterbox import frame_norm_to_pixels
-from .preview import SNAPSHOT_MAX_BYTES, FrameStore, encode_jpeg, start_preview_server
+from .preview import SNAPSHOT_MAX_BYTES, encode_jpeg, start_preview_server
 from .tracker import IoUTracker
 from .hailo_yolo import PERSON_CLASS_NAME, HailoPersonDetector
 
@@ -57,22 +60,21 @@ def model_identifier(path: str) -> str:
     return f"{stem}@{digest.hexdigest()[:12]}"
 
 
-class Detector:
+class Detector(StreamSupervisor):
+    """Supervisor over N streams sharing one HEF / VDevice (see backend.py)."""
+
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.session_id = str(now_ms())
         self.started_at = time.monotonic()
-        self.frame_id = 0
-        self.stream_state = "stopped"
         # FFmpeg on the CPU. Not a fallback on this board -- see the module
         # docstring -- so decode_primary is "sw" too and fallback_active is false.
         self.decode_path = "sw"
-        self.frame_times: collections.deque[float] = collections.deque(maxlen=60)
         self.inference_times: collections.deque[float] = collections.deque(maxlen=200)
         self.pipeline_times: collections.deque[float] = collections.deque(maxlen=200)
-        self.store = FrameStore()
         self.stop_event = threading.Event()
         self.snapshot_count = 0
+        self.max_streams = cfg.max_streams
 
         self.model = HailoPersonDetector(
             cfg.model,
@@ -90,19 +92,23 @@ class Detector:
             self.model.opt_reuse_bindings,
             self.model.opt_reuse_canvas,
         )
-        self.tracker = IoUTracker(cfg.track_iou_threshold, cfg.track_max_lost_s)
+
+        self.backend = HailoBackend(cfg, self.model)
 
         base = f"{cfg.topic_prefix}/{cfg.device_id}"
-        self.topic_detections = f"{base}/detections/{cfg.stream_id}"
+        self.topic_base = base
         self.topic_status = f"{base}/status"
         self.topic_snapshot = f"{base}/snapshot"
         self.topic_cmd_snapshot = f"{base}/cmd/snapshot"
+        self.topic_cmd_control = f"{base}/cmd/control"
+        self.topic_cmd_ack = f"{base}/cmd/ack"
 
         self.client = self._build_client()
+        self.init_streams()
         self.preview_server = None
         if cfg.preview_enabled:
             self.preview_server = start_preview_server(
-                self.store, cfg.stream_id, cfg.preview_bind, cfg.preview_port
+                self.frame_for, self.stream_ids, cfg.preview_bind, cfg.preview_port
             )
             LOG.info(
                 "preview endpoint on http://%s:%d/preview.jpg (live page at /live)",
@@ -136,33 +142,44 @@ class Detector:
         client.on_message = self._on_message
         return client
 
+    def make_tracker(self) -> IoUTracker:
+        """A fresh tracker per stream: track_id is per-stream by contract."""
+        return IoUTracker(self.cfg.track_iou_threshold, self.cfg.track_max_lost_s)
+
     def _on_connect(self, client, _userdata, _flags, rc) -> None:
         if rc != 0:
             LOG.error("mqtt connect failed rc=%s", rc)
             return
-        LOG.info("mqtt connected, subscribing %s", self.topic_cmd_snapshot)
+        LOG.info("mqtt connected, subscribing %s and %s",
+                 self.topic_cmd_snapshot, self.topic_cmd_control)
         client.subscribe(self.topic_cmd_snapshot, qos=1)
+        client.subscribe(self.topic_cmd_control, qos=1)
         self.publish_status()
 
     def _on_message(self, _client, _userdata, msg: mqtt.MQTTMessage) -> None:
-        if msg.topic != self.topic_cmd_snapshot:
-            return
         try:
             request = json.loads(msg.payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            LOG.warning("bad cmd/snapshot payload: %s", exc)
+            LOG.warning("bad %s payload: %s", msg.topic, exc)
+            return
+        if msg.topic == self.topic_cmd_control:
+            self.handle_control(request)
+            return
+        if msg.topic != self.topic_cmd_snapshot:
             return
         event_id = request.get("event_id")
         stream_id = request.get("stream_id")
         if not event_id:
             LOG.warning("cmd/snapshot without event_id, ignored")
             return
-        if stream_id and stream_id != self.cfg.stream_id:
+        if stream_id and stream_id not in self.stream_ids():
             return
-        self.publish_snapshot(str(event_id))
+        self.publish_snapshot(str(event_id), stream_id)
 
-    def publish_snapshot(self, event_id: str) -> bool:
-        frame = self.store.get()
+    def publish_snapshot(self, event_id: str, stream_id: str | None = None) -> bool:
+        ids = self.stream_ids()
+        target = str(stream_id) if stream_id else (ids[0] if ids else "")
+        frame = self.frame_for(target)
         if frame is None:
             LOG.warning("snapshot %s requested before the first frame", event_id)
             return False
@@ -177,208 +194,81 @@ class Detector:
 
     # -------------------------------------------------------------- health
 
-    def measured_fps(self) -> float:
-        if len(self.frame_times) < 2:
-            return 0.0
-        span = self.frame_times[-1] - self.frame_times[0]
-        return 0.0 if span <= 0 else (len(self.frame_times) - 1) / span
+    def decode_path(self, stream_id: str | None = None) -> str:
+        """The decode path of one stream, or of the first for the aggregate."""
+        worker = self.worker(stream_id) if stream_id else (
+            self.workers()[0] if self.workers() else None
+        )
+        return worker.decode if worker else self.cfg.decode_primary
 
-    def health(self) -> dict:
-        return {
-            "fps": round(self.measured_fps(), 2),
-            "decode": self.decode_path,
-            "backend": self.model.backend,
-            "fallback_active": self.decode_path != self.cfg.decode_primary,
-        }
+    def health(self, stream_id: str | None = None) -> dict:
+        """Per-stream when a stream is named, aggregate otherwise.
 
-    def publish_status(self, online: bool = True) -> dict:
-        """Publish the retained status. ``online=False`` is the goodbye message.
-
-        A clean shutdown sends a DISCONNECT, so the broker never delivers the
-        LWT — the retained status is the only thing a consumer will ever see
-        again. Publishing it with ``online: true`` therefore leaves the device
-        advertised as online forever. The goodbye payload mirrors the LWT shape
-        from contracts/MQTT.md (``online: false``, no ``streams`` array) so the
-        hub takes the same path for a clean exit and for a yanked cable.
+        The detection payload carries its own stream's rate: an aggregate there
+        reports a number no single camera is running at, and the hub's
+        per-stream fps column would be wrong by the number of cameras.
         """
-        payload: dict = {
-            "schema": STATUS_SCHEMA,
-            "timestamp": now_ms(),
-            "session_id": self.session_id,
-            "device_id": self.cfg.device_id,
-            "online": online,
-        }
-        if online:
-            stream: dict = {
-                "stream_id": self.cfg.stream_id,
-                "state": self.stream_state,
-                "fps": round(self.measured_fps(), 2),
-                "decode": self.decode_path,
-            }
-            if self.cfg.preview_enabled and self.cfg.preview_advertise_host:
-                base = (
-                    f"http://{self.cfg.preview_advertise_host}:{self.cfg.preview_port}"
-                )
-                stream["preview_url"] = f"{base}/preview/{self.cfg.stream_id}.jpg"
-                # The refreshing-still page served by the same server. Without it
-                # the workbench "live view" button has no target and stays dead.
-                stream["live_url"] = f"{base}/live/{self.cfg.stream_id}"
-            payload["streams"] = [stream]
-            payload["health"] = self.health()
-            payload["versions"] = {"app": self.cfg.app_version, "model": self.model_id}
-            payload["uptime_s"] = round(time.monotonic() - self.started_at, 1)
-        self.client.publish(self.topic_status, json.dumps(payload), qos=1, retain=True)
-        return payload
-
-    # ------------------------------------------------------------ pipeline
-
-    def open_capture(self) -> cv2.VideoCapture:
-        if self.cfg.source.startswith("rtsp://"):
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                f"rtsp_transport;{self.cfg.rtsp_transport}"
-            )
-        capture = cv2.VideoCapture(self.cfg.source, cv2.CAP_FFMPEG)
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return capture
-
-    def build_detection_payload(self, frame: np.ndarray, captured_at: float) -> dict:
-        canvas, transform = self.model.preprocess(frame)
-        detections = self.model.detect(canvas, transform)
-        self.inference_times.append(self.model.last_inference_ms)
-        tracked = self.tracker.update(detections, time.monotonic())
-
-        items = []
-        for track, det in tracked:
-            x1, y1, x2, y2 = det.box
-            items.append(
-                {
-                    "track_id": track.track_id,
-                    "class": PERSON_CLASS_NAME,
-                    "score": round(det.score, 4),
-                    "bbox": [
-                        round((x1 + x2) / 2, 6),
-                        round((y1 + y2) / 2, 6),
-                        round(x2 - x1, 6),
-                        round(y2 - y1, 6),
-                    ],
-                }
-            )
-
-        self.frame_id += 1
-        height, width = frame.shape[:2]
-        pipeline_ms = (time.monotonic() - captured_at) * 1000.0
-        self.pipeline_times.append(pipeline_ms)
         return {
-            "schema": DETECTION_SCHEMA,
-            "timestamp": now_ms(),
-            "session_id": self.session_id,
-            "frame_id": self.frame_id,
-            "device_id": self.cfg.device_id,
-            "stream_id": self.cfg.stream_id,
-            "coordinate_space": "frame_norm",
-            "frame": {"w": int(width), "h": int(height)},
-            # The Hailo inference call alone, which is what the contract asks
-            # for: decode and the NumPy head decode are not included.
-            #
-            # Its coverage depends on the output format. With FLOAT32 outputs
-            # HailoRT dequantizes the whole head inside run(), so that cost is
-            # counted here; with the uint8 path it is not, because it no longer
-            # happens. Comparing this field across that change measures where
-            # the boundary sits, not how fast the board is -- pipeline_ms is the
-            # field that spans both.
-            "inference_time_ms": round(self.model.last_inference_ms, 3),
-            "pipeline_ms": round(pipeline_ms, 3),
-            "detections": items,
-            "health": self.health(),
+            "fps": round(self.measured_fps(stream_id), 2),
+            "decode": self.decode_path(stream_id),
+            "backend": self.model.backend,
+            "fallback_active": (
+                any(w.decode != self.cfg.decode_primary for w in self.workers())
+                if stream_id is None
+                else self.decode_path(stream_id) != self.cfg.decode_primary
+            ),
         }
+
+    # publish_status / status_payload come from StreamSupervisor: the retained
+    # goodbye must mirror the LWT shape (online false, no streams) on every
+    # platform, and a per-platform copy is a per-platform chance to leave a
+    # stopped device advertised as running forever.
 
     def run(self, max_frames: int = 0, max_seconds: float = 0.0, annotate: str = "") -> int:
         self.client.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, self.cfg.mqtt_keepalive)
         self.client.loop_start()
+        self.start_streams()
 
         deadline = time.monotonic() + max_seconds if max_seconds > 0 else float("inf")
-        last_status = 0.0
-        backoff = 1.0
-        capture: cv2.VideoCapture | None = None
-        published = 0
-        annotated_written = False
+        last_status = time.monotonic()
         try:
             while not self.stop_event.is_set() and time.monotonic() < deadline:
-                if capture is None or not capture.isOpened():
-                    if capture is not None:
-                        capture.release()
-                    self.stream_state = "reconnecting"
-                    self.publish_status()
-                    LOG.info("opening source %s", self.cfg.source)
-                    capture = self.open_capture()
-                    if not capture.isOpened():
-                        LOG.warning("source unavailable, retrying in %.1fs", backoff)
-                        self.stop_event.wait(backoff)
-                        backoff = min(backoff * 2, 15.0)
-                        continue
-                    backoff = 1.0
-                    self.stream_state = "running"
-                    self.publish_status()
-                    last_status = time.monotonic()
-
-                ok, frame = capture.read()
-                if not ok or frame is None:
-                    LOG.warning("frame read failed, reopening source")
-                    capture.release()
-                    capture = None
-                    continue
-                # Clock starts here, not before the read: read() blocks until
-                # the next frame exists, so timing from before it would fold
-                # the idle wait for a 5 fps source into pipeline_ms and report
-                # a steady ~200 ms regardless of how fast the board is. That
-                # number is load-bearing -- pipeline_ms exceeding the frame
-                # period is the documented signal that the tracker is being
-                # starved -- so inflating it disables the diagnostic. Same
-                # placement as platforms/rknn, so the two are comparable.
-                captured_at = time.monotonic()
-
-                self.store.put(frame)
-                self.frame_times.append(time.monotonic())
-                payload = self.build_detection_payload(frame, captured_at)
-                self.client.publish(
-                    self.topic_detections, json.dumps(payload), qos=0, retain=False
-                )
-                published += 1
-
-                if annotate and payload["detections"] and not annotated_written:
-                    write_annotated(frame, payload, annotate)
-                    annotated_written = True
-
+                self.stop_event.wait(0.1)
+                # A stream that hit a fatal source error -- a missing decoder
+                # plugin -- is not something a supervisor can retry around.
+                # Surfacing it rather than leaving a silently dead thread is
+                # what keeps a misconfigured deploy from looking like a slow
+                # camera.
+                for worker in self.workers():
+                    if worker.fatal is not None:
+                        raise worker.fatal
                 if time.monotonic() - last_status >= self.cfg.status_interval_s:
                     self.publish_status()
                     last_status = time.monotonic()
-
-                if max_frames and published >= max_frames:
+                if max_frames and self.published() >= max_frames:
                     break
         finally:
-            if capture is not None:
-                capture.release()
-            self.stream_state = "stopped"
-            # online=False: this is a clean exit, so the LWT will not be
-            # delivered and this retained payload is the last word.
+            self.stop_streams()
+            # online=False: a clean exit means the LWT is discarded, so this
+            # retained payload is the last word.
             self.publish_status(online=False)
             self.client.disconnect()
             self.client.loop_stop()
-            self.model.close()
+            close = getattr(self.model, "close", None)
+            if callable(close):
+                close()
             if self.preview_server is not None:
                 self.preview_server.shutdown()
-        inf = sorted(self.inference_times)
-        pipe = sorted(self.pipeline_times)
-
-        def pct(series, q):
-            return series[min(len(series) - 1, int(q * (len(series) - 1)))] if series else 0.0
-
+        published = self.published()
+        inf = sorted(t for w in self.workers() for t in w.inference_times)
         LOG.info(
-            "published %d detection messages, %.2f fps, inference p50=%.2fms "
-            "p95=%.2fms, pipeline p50=%.2fms p95=%.2fms",
+            "published %d detection messages across %d stream(s), %.2f fps, "
+            "inference p50=%.2fms p95=%.2fms",
             published,
+            len(self.workers()),
             self.measured_fps(),
-            pct(inf, 0.5), pct(inf, 0.95), pct(pipe, 0.5), pct(pipe, 0.95),
+            inf[len(inf) // 2] if inf else 0.0,
+            inf[int(0.95 * (len(inf) - 1))] if inf else 0.0,
         )
         return published
 

@@ -314,7 +314,20 @@ class RKNNPersonDetector:
             raise RuntimeError("head layout is only known after the first inference")
         return self._head
 
-    def detect(self, rgb_canvas: np.ndarray, tf: LetterboxTransform) -> list[Detection]:
+    def detect(
+        self,
+        rgb_canvas: np.ndarray,
+        tf: LetterboxTransform,
+        conf_threshold: float | None = None,
+    ) -> list[Detection]:
+        """Detect people in one letterboxed canvas.
+
+        ``conf_threshold`` overrides the session default for this call. One
+        model serves every stream on the process, but the threshold is a
+        per-stream setting an operator retunes at runtime, so it cannot live on
+        the session -- setting it there moves every camera when one slider does.
+        """
+        threshold = self.conf_threshold if conf_threshold is None else conf_threshold
         outputs = self.infer(rgb_canvas)
         # One output is the stock export with DFL inside the graph; several is
         # the model-zoo export with DFL cut out. Deciding from the runtime's
@@ -323,11 +336,11 @@ class RKNNPersonDetector:
         if len(outputs) == 1:
             self._head = "ultralytics"
             return decode_person_head(
-                outputs[0], tf, self.conf_threshold, self.iou_threshold
+                outputs[0], tf, threshold, self.iou_threshold
             )
         self._head = "zoo"
         return decode_zoo_head(
-            outputs, tf, self.conf_threshold, self.iou_threshold, self.input_size
+            outputs, tf, threshold, self.iou_threshold, self.input_size
         )
 
     def close(self) -> None:

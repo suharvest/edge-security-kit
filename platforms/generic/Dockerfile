@@ -57,6 +57,12 @@ WORKDIR /app
 
 COPY --from=builder /install /usr/local
 COPY platforms/generic/esk_generic/ /app/esk_generic/
+# The runtime pieces shared by every platform (the cmd/control decision
+# table, the per-stream capture loop, the N-workers bookkeeping). Copied
+# next to the package rather than installed: it has no third-party imports
+# of its own, so a plain `import esk_core` from WORKDIR is the whole
+# mechanism. See platforms/_shared/README.md.
+COPY platforms/_shared/esk_core/ /app/esk_core/
 COPY platforms/generic/models/yolov8n.onnx /app/models/yolov8n.onnx
 
 RUN python -c "import hashlib,sys; h=hashlib.md5(open('/app/models/yolov8n.onnx','rb').read()).hexdigest(); sys.exit(0 if h=='eda19d19a8aa73d54411a6fc1d091c7f' else 'unexpected model md5: '+h)"

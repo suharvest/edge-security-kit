@@ -141,6 +141,12 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 COPY platforms/jetson/esk_jetson/ /app/esk_jetson/
+# The runtime pieces shared by every platform (the cmd/control decision
+# table, the per-stream capture loop, the N-workers bookkeeping). Copied
+# next to the package rather than installed: it has no third-party imports
+# of its own, so a plain `import esk_core` from WORKDIR is the whole
+# mechanism. See platforms/_shared/README.md.
+COPY platforms/_shared/esk_core/ /app/esk_core/
 COPY platforms/jetson/tools/build_engine.sh /app/tools/build_engine.sh
 COPY platforms/jetson/models/yolov8n.onnx /app/models/yolov8n.onnx
 

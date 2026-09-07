@@ -113,6 +113,12 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 COPY platforms/rknn/esk_rknn/ /app/esk_rknn/
+# The runtime pieces shared by every platform (the cmd/control decision
+# table, the per-stream capture loop, the N-workers bookkeeping). Copied
+# next to the package rather than installed: it has no third-party imports
+# of its own, so a plain `import esk_core` from WORKDIR is the whole
+# mechanism. See platforms/_shared/README.md.
+COPY platforms/_shared/esk_core/ /app/esk_core/
 COPY platforms/rknn/models/yolov8n_zoo_int8.rk3588.rknn \
      platforms/rknn/models/yolov8n_zoo_fp16.rk3588.rknn \
      platforms/rknn/models/yolov8n_zoo_int8.rk3576.rknn \

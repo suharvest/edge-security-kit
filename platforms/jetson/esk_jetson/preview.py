@@ -114,8 +114,12 @@ class _Handler(BaseHTTPRequestHandler):
     server_version = "esk-jetson-preview"
     protocol_version = "HTTP/1.1"
 
-    store: FrameStore
-    stream_id: str
+    # ``lookup`` resolves a stream_id to that stream's latest frame; a detector
+    # carrying several cameras serves one endpoint per stream from one server,
+    # and a stream added at runtime is reachable the moment the supervisor
+    # registers it -- no port to allocate, nothing to restart.
+    lookup: object
+    stream_ids: object
     debug_source: object
 
     def _cors(self) -> None:
@@ -137,10 +141,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _live_page(self) -> None:
-        jpeg_path = f"/preview/{self.stream_id}.jpg"
+    def _live_page(self, stream_id: str) -> None:
+        jpeg_path = f"/preview/{stream_id}.jpg"
         body = LIVE_PAGE.format(
-            stream_id=self.stream_id, jpeg_path=jpeg_path, refresh_ms=LIVE_REFRESH_MS
+            stream_id=stream_id, jpeg_path=jpeg_path, refresh_ms=LIVE_REFRESH_MS
         ).encode("utf-8")
         self.send_response(200)
         self._cors()
@@ -153,8 +157,13 @@ class _Handler(BaseHTTPRequestHandler):
         import json
 
         path = self.path.split("?", 1)[0]
-        if path in ("/", "/live", f"/live/{self.stream_id}"):
-            self._live_page()
+        streams = self.stream_ids()
+        default = streams[0] if streams else ""
+        if path in ("/", "/live"):
+            self._live_page(default)
+            return
+        if path.startswith("/live/"):
+            self._live_page(path[len("/live/"):])
             return
         if path == "/healthz":
             self._json(b'{"ok":true}')
@@ -180,10 +189,17 @@ class _Handler(BaseHTTPRequestHandler):
                 ).encode("utf-8")
             )
             return
-        if path not in ("/preview.jpg", f"/preview/{self.stream_id}.jpg"):
+        if path == "/preview.jpg":
+            stream_id = default
+        elif path.startswith("/preview/") and path.endswith(".jpg"):
+            stream_id = path[len("/preview/"):-len(".jpg")]
+        else:
             self.send_error(404, "no such preview")
             return
-        frame = self.store.get()
+        frame = self.lookup(stream_id)
+        if frame is None and stream_id not in streams:
+            self.send_error(404, f"no such stream: {stream_id}")
+            return
         if frame is None:
             self.send_error(503, "no frame decoded yet")
             return
@@ -203,14 +219,14 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def start_preview_server(
-    store: FrameStore, stream_id: str, bind: str, port: int, debug_source=None
+    lookup, stream_ids, bind: str, port: int, debug_source=None
 ) -> ThreadingHTTPServer:
     handler = type(
         "PreviewHandler",
         (_Handler,),
         {
-            "store": store,
-            "stream_id": stream_id,
+            "lookup": staticmethod(lookup),
+            "stream_ids": staticmethod(stream_ids),
             # staticmethod, not the bare callable: a plain function in a class
             # dict becomes a bound method on attribute access, so the accessor
             # would be handed the request handler as its first argument and

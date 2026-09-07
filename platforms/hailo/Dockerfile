@@ -96,6 +96,12 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 COPY platforms/hailo/esk_hailo/ /app/esk_hailo/
+# The runtime pieces shared by every platform (the cmd/control decision
+# table, the per-stream capture loop, the N-workers bookkeeping). Copied
+# next to the package rather than installed: it has no third-party imports
+# of its own, so a plain `import esk_core` from WORKDIR is the whole
+# mechanism. See platforms/_shared/README.md.
+COPY platforms/_shared/esk_core/ /app/esk_core/
 COPY platforms/hailo/models/yolov8n.hef platforms/hailo/models/SHA256SUMS /app/models/
 
 RUN cd /app/models \

@@ -27,12 +27,14 @@ import time
 import numpy as np
 import paho.mqtt.client as mqtt
 
+from esk_core import StreamSupervisor
+
+from .backend import JetsonBackend
 from .config import Config
 from .letterbox import frame_norm_to_pixels
-from .preview import SNAPSHOT_MAX_BYTES, FrameStore, encode_jpeg, start_preview_server
+from .preview import SNAPSHOT_MAX_BYTES, encode_jpeg, start_preview_server
 from .tracker import IoUTracker
 from .trt_yolo import PERSON_CLASS_NAME, TRTPersonDetector, decode_person_head
-from .video_source import DECODE_SW, HardwareDecodeUnavailable, open_source
 
 LOG = logging.getLogger("esk.jetson")
 
@@ -102,21 +104,18 @@ class StageTimings:
         return result
 
 
-class Detector:
+class Detector(StreamSupervisor):
+    """Supervisor over N streams sharing one accelerator (see backend.py)."""
+
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.session_id = str(now_ms())
         self.started_at = time.monotonic()
-        self.frame_id = 0
-        self.stream_state = "stopped"
-        self.decode_path = cfg.decode_primary
-        self.frame_times: collections.deque[float] = collections.deque(maxlen=60)
         self.inference_times: collections.deque[float] = collections.deque(maxlen=2000)
         self.stages = StageTimings()
-        self.store = FrameStore()
         self.stop_event = threading.Event()
         self.snapshot_count = 0
-        self.source = None
+        self.max_streams = cfg.max_streams
 
         self.model = TRTPersonDetector(
             cfg.model,
@@ -125,23 +124,32 @@ class Detector:
             input_size=cfg.input_size,
         )
         self.model_id = model_identifier(cfg.model)
-        self.tracker = IoUTracker(cfg.track_iou_threshold, cfg.track_max_lost_s)
+
+        self.backend = JetsonBackend(cfg, self.model)
 
         base = f"{cfg.topic_prefix}/{cfg.device_id}"
-        self.topic_detections = f"{base}/detections/{cfg.stream_id}"
+        self.topic_base = base
         self.topic_status = f"{base}/status"
         self.topic_snapshot = f"{base}/snapshot"
         self.topic_cmd_snapshot = f"{base}/cmd/snapshot"
+        self.topic_cmd_control = f"{base}/cmd/control"
+        self.topic_cmd_ack = f"{base}/cmd/ack"
 
         self.client = self._build_client()
+        self.init_streams()
         self.preview_server = None
         if cfg.preview_enabled:
             self.preview_server = start_preview_server(
-                self.store,
-                cfg.stream_id,
+                self.frame_for,
+                self.stream_ids,
                 cfg.preview_bind,
                 cfg.preview_port,
-                debug_source=lambda: self.source,
+                # /debug/decode reports the first stream's source; with several
+                # cameras the per-stream decode path is in the status
+                # message, which is where a consumer should read it.
+                debug_source=lambda: (
+                    self.workers()[0].source if self.workers() else None
+                ),
             )
             LOG.info(
                 "preview on http://%s:%d/preview.jpg (live /live, decode evidence /debug/decode)",
@@ -175,33 +183,44 @@ class Detector:
         client.on_message = self._on_message
         return client
 
+    def make_tracker(self) -> IoUTracker:
+        """A fresh tracker per stream: track_id is per-stream by contract."""
+        return IoUTracker(self.cfg.track_iou_threshold, self.cfg.track_max_lost_s)
+
     def _on_connect(self, client, _userdata, _flags, rc) -> None:
         if rc != 0:
             LOG.error("mqtt connect failed rc=%s", rc)
             return
-        LOG.info("mqtt connected, subscribing %s", self.topic_cmd_snapshot)
+        LOG.info("mqtt connected, subscribing %s and %s",
+                 self.topic_cmd_snapshot, self.topic_cmd_control)
         client.subscribe(self.topic_cmd_snapshot, qos=1)
+        client.subscribe(self.topic_cmd_control, qos=1)
         self.publish_status()
 
     def _on_message(self, _client, _userdata, msg: mqtt.MQTTMessage) -> None:
-        if msg.topic != self.topic_cmd_snapshot:
-            return
         try:
             request = json.loads(msg.payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            LOG.warning("bad cmd/snapshot payload: %s", exc)
+            LOG.warning("bad %s payload: %s", msg.topic, exc)
+            return
+        if msg.topic == self.topic_cmd_control:
+            self.handle_control(request)
+            return
+        if msg.topic != self.topic_cmd_snapshot:
             return
         event_id = request.get("event_id")
         stream_id = request.get("stream_id")
         if not event_id:
             LOG.warning("cmd/snapshot without event_id, ignored")
             return
-        if stream_id and stream_id != self.cfg.stream_id:
+        if stream_id and stream_id not in self.stream_ids():
             return
-        self.publish_snapshot(str(event_id))
+        self.publish_snapshot(str(event_id), stream_id)
 
-    def publish_snapshot(self, event_id: str) -> bool:
-        frame = self.store.get()
+    def publish_snapshot(self, event_id: str, stream_id: str | None = None) -> bool:
+        ids = self.stream_ids()
+        target = str(stream_id) if stream_id else (ids[0] if ids else "")
+        frame = self.frame_for(target)
         if frame is None:
             LOG.warning("snapshot %s requested before the first frame", event_id)
             return False
@@ -216,225 +235,78 @@ class Detector:
 
     # -------------------------------------------------------------- health
 
-    def measured_fps(self) -> float:
-        if len(self.frame_times) < 2:
-            return 0.0
-        span = self.frame_times[-1] - self.frame_times[0]
-        return 0.0 if span <= 0 else (len(self.frame_times) - 1) / span
+    def decode_path(self, stream_id: str | None = None) -> str:
+        """The decode path of one stream, or of the first for the aggregate."""
+        worker = self.worker(stream_id) if stream_id else (
+            self.workers()[0] if self.workers() else None
+        )
+        return worker.decode if worker else self.cfg.decode_primary
 
-    def health(self) -> dict:
-        return {
-            "fps": round(self.measured_fps(), 2),
-            "decode": self.decode_path,
-            "backend": self.model.backend,
-            # True whenever either configured-primary path is on its fallback.
-            # Decode is the only one that can fall back here: there is no CPU
-            # inference path, the detector refuses to start without the engine.
-            "fallback_active": self.decode_path != self.cfg.decode_primary,
-        }
+    def health(self, stream_id: str | None = None) -> dict:
+        """Per-stream when a stream is named, aggregate otherwise.
 
-    def publish_status(self, online: bool = True) -> dict:
-        """Publish the retained status. ``online=False`` is the goodbye message.
-
-        A clean shutdown sends a DISCONNECT, so the broker discards the LWT and
-        the retained status is the last word any consumer will ever see.
-        Leaving ``online: true`` there advertises a stopped device as running
-        forever, so the goodbye mirrors the LWT shape exactly.
+        The detection payload carries its own stream's rate: an aggregate there
+        reports a number no single camera is running at, and the hub's
+        per-stream fps column would be wrong by the number of cameras.
         """
-        payload: dict = {
-            "schema": STATUS_SCHEMA,
-            "timestamp": now_ms(),
-            "session_id": self.session_id,
-            "device_id": self.cfg.device_id,
-            "online": online,
-        }
-        if online:
-            stream: dict = {
-                "stream_id": self.cfg.stream_id,
-                "state": self.stream_state,
-                "fps": round(self.measured_fps(), 2),
-                "decode": self.decode_path,
-            }
-            if self.cfg.preview_enabled and self.cfg.preview_advertise_host:
-                base = f"http://{self.cfg.preview_advertise_host}:{self.cfg.preview_port}"
-                stream["preview_url"] = f"{base}/preview/{self.cfg.stream_id}.jpg"
-                stream["live_url"] = f"{base}/live/{self.cfg.stream_id}"
-            payload["streams"] = [stream]
-            payload["health"] = self.health()
-            payload["versions"] = {"app": self.cfg.app_version, "model": self.model_id}
-            payload["uptime_s"] = round(time.monotonic() - self.started_at, 1)
-        self.client.publish(self.topic_status, json.dumps(payload), qos=1, retain=True)
-        return payload
-
-    # ------------------------------------------------------------ pipeline
-
-    def open_capture(self):
-        source = open_source(
-            self.cfg.source,
-            size=self.cfg.input_size,
-            transport=self.cfg.rtsp_transport,
-            codec=self.cfg.rtsp_codec,
-            require_hw=self.cfg.require_hw_decode,
-            latency_ms=self.cfg.rtsp_latency_ms,
-            appsink_timeout_ms=self.cfg.appsink_timeout_ms,
-            appsink_queue=self.cfg.appsink_queue,
-        )
-        self.decode_path = source.decode_path
-        if self.decode_path == DECODE_SW:
-            LOG.warning("running on the CPU decoder; health.decode=sw, fallback_active=true")
-        return source
-
-    def build_detection_payload(self, bundle, captured_at: float) -> dict:
-        # The three model stages are driven separately rather than through
-        # model.detect(), so the timing split is measured rather than guessed.
-        started = time.perf_counter()
-        self.model.preprocess_into(bundle.canvas)
-        self.stages.add("preprocess", (time.perf_counter() - started) * 1000.0)
-
-        started = time.perf_counter()
-        raw = self.model.infer()
-        self.stages.add("infer", (time.perf_counter() - started) * 1000.0)
-        self.inference_times.append(self.model.last_inference_ms)
-
-        started = time.perf_counter()
-        detections = decode_person_head(
-            np.asarray(raw, dtype=np.float32),
-            bundle.transform,
-            self.cfg.conf_threshold,
-            self.cfg.iou_threshold,
-        )
-        tracked = self.tracker.update(detections, time.monotonic())
-        items = []
-        for track, det in tracked:
-            x1, y1, x2, y2 = det.box
-            items.append(
-                {
-                    "track_id": track.track_id,
-                    "class": PERSON_CLASS_NAME,
-                    "score": round(det.score, 4),
-                    "bbox": [
-                        round((x1 + x2) / 2, 6),
-                        round((y1 + y2) / 2, 6),
-                        round(x2 - x1, 6),
-                        round(y2 - y1, 6),
-                    ],
-                }
-            )
-        self.stages.add("postprocess", (time.perf_counter() - started) * 1000.0)
-
-        self.frame_id += 1
-        tf = bundle.transform
         return {
-            "schema": DETECTION_SCHEMA,
-            "timestamp": now_ms(),
-            "session_id": self.session_id,
-            "frame_id": self.frame_id,
-            "device_id": self.cfg.device_id,
-            "stream_id": self.cfg.stream_id,
-            "coordinate_space": "frame_norm",
-            "frame": {"w": int(tf.src_w), "h": int(tf.src_h)},
-            # The TensorRT execute_async_v3 call alone, timed with CUDA events
-            # on the device clock, which is what the contract asks for. Decode
-            # runs on NVDEC and preprocessing on the CPU; neither is included.
-            "inference_time_ms": round(self.model.last_inference_ms, 3),
-            "pipeline_ms": round((time.monotonic() - captured_at) * 1000.0, 3),
-            "detections": items,
-            "health": self.health(),
+            "fps": round(self.measured_fps(stream_id), 2),
+            "decode": self.decode_path(stream_id),
+            "backend": self.model.backend,
+            "fallback_active": (
+                any(w.decode != self.cfg.decode_primary for w in self.workers())
+                if stream_id is None
+                else self.decode_path(stream_id) != self.cfg.decode_primary
+            ),
         }
+
+    # publish_status / status_payload come from StreamSupervisor: the retained
+    # goodbye must mirror the LWT shape (online false, no streams) on every
+    # platform, and a per-platform copy is a per-platform chance to leave a
+    # stopped device advertised as running forever.
 
     def run(self, max_frames: int = 0, max_seconds: float = 0.0, annotate: str = "") -> int:
         self.client.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, self.cfg.mqtt_keepalive)
         self.client.loop_start()
+        self.start_streams()
 
         deadline = time.monotonic() + max_seconds if max_seconds > 0 else float("inf")
-        last_status = 0.0
-        backoff = 1.0
-        published = 0
-        annotated_written = False
+        last_status = time.monotonic()
         try:
             while not self.stop_event.is_set() and time.monotonic() < deadline:
-                if self.source is None:
-                    self.stream_state = "reconnecting"
-                    self.publish_status()
-                    LOG.info("opening source %s", self.cfg.source)
-                    try:
-                        self.source = self.open_capture()
-                    except HardwareDecodeUnavailable:
-                        # Configuration fault, not a transient one: retrying
-                        # cannot install a GStreamer plugin.
-                        raise
-                    except Exception as exc:
-                        LOG.warning("source unavailable (%s), retrying in %.1fs", exc, backoff)
-                        self.source = None
-                        self.stop_event.wait(backoff)
-                        backoff = min(backoff * 2, 15.0)
-                        continue
-                    backoff = 1.0
-                    self.stream_state = "running"
-                    self.publish_status()
-                    last_status = time.monotonic()
-
-                try:
-                    bundle = self.source.read()
-                except Exception as exc:
-                    LOG.warning("read failed (%s), reopening source", exc)
-                    self.source.close()
-                    self.source = None
-                    continue
-                if bundle is None:
-                    # A pull timeout is normal on a stream that has paused.
-                    continue
-                # Clock starts here, not before the read: read() blocks until
-                # the next frame exists, so timing from before it would fold the
-                # idle wait for a 15 fps source into pipeline_ms and report a
-                # steady ~66 ms regardless of how fast the board actually is.
-                # That number is load-bearing -- pipeline_ms exceeding the frame
-                # period is the documented signal that the tracker is being
-                # starved and the hub's alerts are wrong on bad input -- so
-                # inflating it would disable the diagnostic.
-                captured_at = time.monotonic()
-                self.stages.add("decode", bundle.decode_ms)
-                self.stages.add("letterbox", bundle.letterbox_ms)
-
-                self.store.put(bundle.active_rgb())
-                self.frame_times.append(time.monotonic())
-                payload = self.build_detection_payload(bundle, captured_at)
-
-                started = time.perf_counter()
-                self.client.publish(
-                    self.topic_detections, json.dumps(payload), qos=0, retain=False
-                )
-                self.stages.add("publish", (time.perf_counter() - started) * 1000.0)
-                self.stages.pipeline.append((time.monotonic() - captured_at) * 1000.0)
-                published += 1
-
-                if annotate and payload["detections"] and not annotated_written:
-                    write_annotated(bundle, payload, annotate)
-                    annotated_written = True
-
+                self.stop_event.wait(0.1)
+                # A stream that hit a fatal source error -- a missing decoder
+                # plugin -- is not something a supervisor can retry around.
+                # Surfacing it rather than leaving a silently dead thread is
+                # what keeps a misconfigured deploy from looking like a slow
+                # camera.
+                for worker in self.workers():
+                    if worker.fatal is not None:
+                        raise worker.fatal
                 if time.monotonic() - last_status >= self.cfg.status_interval_s:
                     self.publish_status()
                     last_status = time.monotonic()
-
-                if max_frames and published >= max_frames:
+                if max_frames and self.published() >= max_frames:
                     break
         finally:
-            if self.source is not None:
-                self.source.close()
-                self.source = None
-            self.stream_state = "stopped"
+            self.stop_streams()
             # online=False: a clean exit means the LWT is discarded, so this
             # retained payload is the last word.
             self.publish_status(online=False)
             self.client.disconnect()
             self.client.loop_stop()
-            self.model.close()
+            close = getattr(self.model, "close", None)
+            if callable(close):
+                close()
             if self.preview_server is not None:
                 self.preview_server.shutdown()
-        inf = sorted(self.inference_times)
+        published = self.published()
+        inf = sorted(t for w in self.workers() for t in w.inference_times)
         LOG.info(
-            "published %d detection messages, %.2f fps, inference p50=%.2fms p95=%.2fms",
+            "published %d detection messages across %d stream(s), %.2f fps, "
+            "inference p50=%.2fms p95=%.2fms",
             published,
+            len(self.workers()),
             self.measured_fps(),
             inf[len(inf) // 2] if inf else 0.0,
             inf[int(0.95 * (len(inf) - 1))] if inf else 0.0,
