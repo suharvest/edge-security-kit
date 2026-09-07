@@ -192,7 +192,8 @@ threshold before reaching for fp16.
 ```
 contracts/     MQTT payload schema, semantics, conformance fixtures + gate
 hub/           rule engine, alert lifecycle, SQLite, REST/WS API, cookie sessions
-web/           workbench, rule editor, device page (Preact + htm, no build step)
+web/           workbench, video wall, rule editor, device page (Preact + htm, no build step)
+media/         capture sets backing what the docs claim the UI does
 platforms/
   jetson/      NVDEC + TensorRT, all Python
   rknn/        MPP + RGA + RKNN, int8 and fp16, RK3588 and RK3576
@@ -201,6 +202,26 @@ platforms/
 tools/
   rtsp-fixture/ mediamtx, the truth-video generator and the acceptance harness
 ```
+
+## The console
+
+Four screens: the alert workbench, a video wall, the rule editor and the device
+page. The wall is the one an operator leaves on a screen — an adaptive 1/2/4/6/9
+grid, each tile carrying the detector's boxes and the stream's own zone and line
+drawn over the picture, `F` for fullscreen on an HDMI display.
+
+Two settings are changed from there rather than from a config file, because both
+are things someone decides while looking at the scene: a per-stream confidence
+threshold, and which cameras a detector is watching. Both travel as
+`cmd/control` and are answered by the detector, so the console can say whether
+the change is live rather than whether the request was sent. `media/` has the
+captures.
+
+**The video does not pass through the hub.** Tiles embed the stream's own
+`live_url` and the browser fetches it directly; the hub carries the overlay JSON
+and a cached single frame for a tile the browser cannot reach. Its cost is flat
+in the number of people watching, which is the property that separates this from
+a VMS — see HUB_SPEC §11.
 
 ## The contract
 
