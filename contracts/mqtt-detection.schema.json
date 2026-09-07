@@ -2,11 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://seeed.studio/schemas/edge-security/mqtt-detection-v1.json",
   "title": "Cross-platform edge-security MQTT messages v1",
-  "description": "Top-level schema for the three message kinds published by edge-security detectors and the hub: sensecraft.detection/1, sensecraft.status/1, sensecraft.event/1. A payload must match exactly one branch, discriminated by its `schema` field.",
+  "description": "Top-level schema for the five message kinds on the edge-security bus: sensecraft.detection/1, sensecraft.status/1 and sensecraft.event/1 on the uplink, sensecraft.command/1 on the cmd/control downlink and sensecraft.ack/1 answering it. A payload must match exactly one branch, discriminated by its `schema` field.",
   "oneOf": [
     {"$ref": "#/$defs/detection_message"},
     {"$ref": "#/$defs/status_message"},
-    {"$ref": "#/$defs/event_message"}
+    {"$ref": "#/$defs/event_message"},
+    {"$ref": "#/$defs/command_message"},
+    {"$ref": "#/$defs/ack_message"}
   ],
   "$defs": {
     "bbox_norm": {
@@ -46,6 +48,54 @@
       "type": "string",
       "minLength": 1,
       "description": "Generated once per detector process start (boot epoch ms or uuid recommended). A new value tells consumers that frame_id, track_id and event sequence counters have reset; the hub drops all per-track rule state for the device on seeing it change"
+    },
+    "command_name": {
+      "enum": ["set_conf_threshold", "add_stream", "remove_stream"],
+      "description": "Runtime control verbs a detector must answer on cmd/control. set_conf_threshold retunes one stream's detection confidence without a restart; add_stream/remove_stream attach and detach a source at runtime."
+    },
+    "command_message": {
+      "type": "object",
+      "required": ["schema", "timestamp", "request_id", "device_id", "command", "params"],
+      "properties": {
+        "schema": {"const": "sensecraft.command/1"},
+        "timestamp": {"type": "integer", "minimum": 0, "description": "Unix epoch milliseconds at the sender"},
+        "request_id": {"type": "string", "minLength": 1, "description": "Unique per command. The ack echoes it; a detector that receives the same request_id twice must apply the command once and ack twice."},
+        "device_id": {"type": "string", "minLength": 1},
+        "command": {"$ref": "#/$defs/command_name"},
+        "params": {
+          "type": "object",
+          "description": "Command-specific arguments. set_conf_threshold: {stream_id, conf_threshold}. add_stream: {stream_id, source, name?, rtsp_transport?}. remove_stream: {stream_id}.",
+          "properties": {
+            "stream_id": {"type": "string", "minLength": 1},
+            "conf_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+            "source": {"type": "string", "minLength": 1},
+            "name": {"type": "string"},
+            "rtsp_transport": {"enum": ["tcp", "udp"]}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "ack_message": {
+      "type": "object",
+      "required": ["schema", "timestamp", "session_id", "device_id", "request_id", "command", "ok"],
+      "properties": {
+        "schema": {"const": "sensecraft.ack/1"},
+        "timestamp": {"type": "integer", "minimum": 0},
+        "session_id": {"$ref": "#/$defs/session_id"},
+        "device_id": {"type": "string", "minLength": 1},
+        "request_id": {"type": "string", "minLength": 1},
+        "command": {"$ref": "#/$defs/command_name"},
+        "ok": {"type": "boolean", "description": "true only when the change is live in the running detector, not merely accepted for later"},
+        "error": {"type": "string", "description": "Present when ok is false. Operator-facing reason, e.g. 'source unreachable'."},
+        "applied": {
+          "type": "object",
+          "description": "The values actually in force after the command, so a caller never has to assume its request was taken verbatim.",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
     },
     "detection_message": {
       "type": "object",

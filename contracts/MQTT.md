@@ -12,6 +12,8 @@ Three message kinds share one schema file, discriminated by the `schema` field:
 | `sensecraft.detection/1` | detector | per-frame detection results |
 | `sensecraft.status/1` | detector | heartbeat / health, plus LWT offline |
 | `sensecraft.event/1` | rule engine (device-local or hub) | rule events: zone_enter / loitering / line_cross |
+| `sensecraft.command/1` | hub | runtime control downlink: retune confidence, attach or detach a stream |
+| `sensecraft.ack/1` | detector | the answer to one command, carrying the values actually in force |
 
 ## Topics
 
@@ -21,11 +23,15 @@ sensecraft/security/<device_id>/events/<stream_id>       QoS1, no retain
 sensecraft/security/<device_id>/status                   QoS1, retain, + LWT
 sensecraft/security/<device_id>/snapshot/<event_id>      QoS1, no retain
 sensecraft/security/<device_id>/cmd/snapshot             QoS1, no retain (downlink)
+sensecraft/security/<device_id>/cmd/control              QoS1, no retain (downlink)
+sensecraft/security/<device_id>/cmd/ack                  QoS1, no retain (uplink)
 ```
 
 - `<device_id>` and `<stream_id>` are stable configured IDs. Both are also
   required inside every payload; consumers must not depend on topic parsing.
-- `cmd/snapshot` is the one downlink: in hub mode the rule engine runs off-device,
+- `cmd/control` and `cmd/ack` are the runtime control pair; see "Control
+  downlink" below.
+- `cmd/snapshot` is the evidence downlink: in hub mode the rule engine runs off-device,
   so the hub requests evidence by publishing `{"stream_id": ..., "event_id": ...}`
   there; the device answers on the snapshot topic. Devices that run rules locally
   (single-box mode, reCamera) publish snapshots unprompted.
@@ -116,6 +122,66 @@ sensecraft/security/<device_id>/cmd/snapshot             QoS1, no retain (downli
   A break in the frame chain (`line_chain_gap_ms`, HUB_SPEC §2.1) discards
   `last_nonzero_side` along with the rest of the chain: the track is re-seeded
   from wherever it is next observed.
+
+## Control downlink
+
+Two things an operator changes while the site is running — the detection
+confidence a stream runs at, and which cameras a detector is watching — do not
+belong in a config file that only takes effect on the next restart. They travel
+as `sensecraft.command/1` on `cmd/control` and are answered with
+`sensecraft.ack/1` on `cmd/ack`.
+
+```
+hub  ->  sensecraft/security/generic-01/cmd/control
+         {"schema":"sensecraft.command/1","timestamp":1757203411000,
+          "request_id":"hub-9f2c1a04-0001","device_id":"generic-01",
+          "command":"set_conf_threshold",
+          "params":{"stream_id":"cam-0","conf_threshold":0.42}}
+
+detector -> sensecraft/security/generic-01/cmd/ack
+         {"schema":"sensecraft.ack/1","timestamp":1757203411087,
+          "session_id":"1757203390412","device_id":"generic-01",
+          "request_id":"hub-9f2c1a04-0001","command":"set_conf_threshold",
+          "ok":true,"applied":{"stream_id":"cam-0","conf_threshold":0.42,
+                               "persisted":true}}
+```
+
+| `command` | Required `params` | Effect |
+|---|---|---|
+| `set_conf_threshold` | `stream_id`, `conf_threshold` (0–1) | the stream's detector runs at the new threshold from its next frame |
+| `add_stream` | `stream_id`, `source`; optional `name`, `rtsp_transport` | a new stream starts and appears in the next status message |
+| `remove_stream` | `stream_id` | that stream stops and leaves the status message |
+
+Four rules make this safe to build a console on:
+
+- **`ok: true` means live, not accepted.** A detector acks after the change is in
+  force in the running process — the threshold is the one the next frame will
+  use, the new stream has opened its source. Something that will only take
+  effect on restart must ack `ok: false` with the reason, never `ok: true`.
+- **`request_id` is the correlation, not the topic.** Both directions carry it,
+  a caller matches its pending request on it, and a detector that sees the same
+  `request_id` twice applies the command once and acks twice — a redelivered
+  QoS 1 command must not add a stream twice.
+- **`applied` is the truth.** A detector that clamps, rounds or renames what it
+  was asked for reports what it actually did, so a caller never has to assume
+  its request was taken verbatim. `persisted` says whether the change also
+  survives a restart (written back to the detector's config file) or is
+  in-memory only.
+- **An unanswered command is a failure, not a silent success.** A caller waits
+  a bounded time for the ack and reports a timeout; nothing about the detector
+  state may be inferred from silence. The hub's REST layer answers `504` there.
+
+A detector that implements none of this stays conformant: `cmd/control` is
+optional, and the hub reports the timeout. A detector that implements
+`set_conf_threshold` but not `add_stream` acks the second with `ok: false` and
+an error naming the missing capability — that is how a console tells "this
+platform cannot" from "this platform is down".
+
+**Multi-stream is a detector property, not a contract one.** `add_stream` asks
+one detector process to carry another source. A single-stream runtime answers
+`ok: false`; adding a camera to that platform means starting a second detector
+process with its own `stream_id`, which the hub sees through the ordinary
+status topic and needs no command for.
 
 ## Status and LWT
 

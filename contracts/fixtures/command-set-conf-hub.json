@@ -1,0 +1,11 @@
+{
+  "schema": "sensecraft.command/1",
+  "timestamp": 1757203411000,
+  "request_id": "hub-9f2c1a04-0001",
+  "device_id": "generic-01",
+  "command": "set_conf_threshold",
+  "params": {
+    "stream_id": "cam-0",
+    "conf_threshold": 0.42
+  }
+}

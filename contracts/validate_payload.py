@@ -17,6 +17,8 @@ from pathlib import Path
 DETECTION = "sensecraft.detection/1"
 STATUS = "sensecraft.status/1"
 EVENT = "sensecraft.event/1"
+COMMAND = "sensecraft.command/1"
+ACK = "sensecraft.ack/1"
 
 DETECTION_REQUIRED = {
     "schema", "timestamp", "session_id", "frame_id", "device_id", "stream_id",
@@ -32,6 +34,18 @@ HEALTH_REQUIRED = {"fps", "decode", "backend", "fallback_active"}
 EVENT_TYPES = {"zone_enter", "loitering", "line_cross"}
 STREAM_STATES = {"running", "reconnecting", "stopped"}
 DECODE_PATHS = {"hw", "sw"}
+COMMAND_REQUIRED = {"schema", "timestamp", "request_id", "device_id", "command", "params"}
+ACK_REQUIRED = {
+    "schema", "timestamp", "session_id", "device_id", "request_id", "command", "ok",
+}
+COMMAND_NAMES = {"set_conf_threshold", "add_stream", "remove_stream"}
+#: Per-command required params. The runtime control surface is small on purpose:
+#: anything that needs a restart belongs in the config file, not here.
+COMMAND_PARAMS = {
+    "set_conf_threshold": {"stream_id", "conf_threshold"},
+    "add_stream": {"stream_id", "source"},
+    "remove_stream": {"stream_id"},
+}
 
 
 def _require(obj: object, keys: set[str], where: str) -> dict:
@@ -172,10 +186,49 @@ def validate_event(payload: dict) -> None:
         _nonempty_str(payload["class"], "payload.class")
 
 
+def validate_command(payload: dict) -> None:
+    _require(payload, COMMAND_REQUIRED, "payload")
+    _epoch_ms(payload["timestamp"], "payload.timestamp")
+    _nonempty_str(payload["request_id"], "payload.request_id")
+    _nonempty_str(payload["device_id"], "payload.device_id")
+    command = payload["command"]
+    if command not in COMMAND_NAMES:
+        raise ValueError(f"payload.command: expected one of {sorted(COMMAND_NAMES)}")
+    params = _require(payload["params"], COMMAND_PARAMS[command], f"payload.params ({command})")
+    _nonempty_str(params["stream_id"], "payload.params.stream_id")
+    if command == "set_conf_threshold":
+        _number(params["conf_threshold"], "payload.params.conf_threshold", 0, 1)
+    if command == "add_stream":
+        _nonempty_str(params["source"], "payload.params.source")
+        transport = params.get("rtsp_transport")
+        if transport is not None and transport not in ("tcp", "udp"):
+            raise ValueError("payload.params.rtsp_transport: expected tcp or udp")
+
+
+def validate_ack(payload: dict) -> None:
+    _require(payload, ACK_REQUIRED, "payload")
+    _epoch_ms(payload["timestamp"], "payload.timestamp")
+    _nonempty_str(payload["session_id"], "payload.session_id")
+    _nonempty_str(payload["device_id"], "payload.device_id")
+    _nonempty_str(payload["request_id"], "payload.request_id")
+    if payload["command"] not in COMMAND_NAMES:
+        raise ValueError(f"payload.command: expected one of {sorted(COMMAND_NAMES)}")
+    if not isinstance(payload["ok"], bool):
+        raise ValueError("payload.ok: expected a boolean")
+    # A failure that carries no reason is unactionable at the console, so the
+    # field is required in exactly the case where it means something.
+    if payload["ok"] is False:
+        _nonempty_str(payload.get("error"), "payload.error")
+    if "applied" in payload and not isinstance(payload["applied"], dict):
+        raise ValueError("payload.applied: expected an object")
+
+
 VALIDATORS = {
     DETECTION: validate_detection,
     STATUS: validate_status,
     EVENT: validate_event,
+    COMMAND: validate_command,
+    ACK: validate_ack,
 }
 
 

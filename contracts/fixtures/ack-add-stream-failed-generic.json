@@ -1,0 +1,10 @@
+{
+  "schema": "sensecraft.ack/1",
+  "timestamp": 1757203471244,
+  "session_id": "1757203390412",
+  "device_id": "generic-01",
+  "request_id": "hub-9f2c1a04-0002",
+  "command": "add_stream",
+  "ok": false,
+  "error": "source unreachable: rtsp://127.0.0.1:8555/edge-sec-720p did not open within 5.0s"
+}

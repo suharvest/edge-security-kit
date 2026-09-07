@@ -23,6 +23,17 @@ sh contracts/check_fixtures.sh
 | `event-line-cross-hub.json` | same | `line_cross` carries `direction` (schema requires it conditionally). |
 | `event-loitering-hub.json` | same | `loitering` carries `dwell_s`. Capturing this one surfaced a defect: with `event_type` missing from the cooldown key, the zone's `zone_enter` swallowed its own `loitering` escalation and the event never fired. |
 | `event-zone-enter-device.json` | shape a single-box publisher (reCamera-class) sends | `origin: "device"` — the only origin permitted to mark a device as single-box. |
+| `command-set-conf-hub.json` | `PUT /api/devices/generic-01/streams/cam-0/conf` against a live hub, read off `cmd/control` | The control downlink shape: `request_id` as the only correlation, `params` carrying the whole argument list. |
+| `command-add-stream-hub.json` | `POST /api/devices/generic-01/streams` on the same hub | `add_stream` params — `source` is the detector's problem to open, `name` is carried through for the console only. |
+| `ack-set-conf-generic.json` | `platforms/generic` answering the command above | The success ack: `applied` reports what is actually in force, and `persisted: true` says the value also survives a restart. |
+| `ack-add-stream-failed-generic.json` | same detector, given an RTSP URL that does not open | The failure ack. `ok: false` requires `error`; a caller must never read a failure as "probably fine". |
+
+The four control fixtures are the exception to the capture rule above, and it
+is worth saying which way: the two `command-*` files are read off a live hub's
+`cmd/control` publish, but the two `ack-*` files are hand-written to the spec —
+`platforms/generic` is the only runtime that answers `cmd/control` today, so
+there is no second implementation to capture the shape from yet. Treat them as
+the specification's own worked examples until a second platform lands one.
 
 Two independent detector implementations now back the same contract. The
 platform copies stay under `platforms/<name>/fixtures/`; the files here are
