@@ -51,6 +51,21 @@ The model script this produces is committed as `yolov8n.alls` for reference.
 | Target | HAILO8, single context |
 | Utilization | control 75%, compute 44.1%, memory 27.7% |
 
+## Where to get it
+
+The compiled HEF is published as a release artifact rather than committed, so a
+build host without the Dataflow Compiler can still assemble the image:
+
+```bash
+curl -fSL -o yolov8n.hef \
+  https://sensecraft-statics.seeed.cc/solution-app/edge_security/models/yolov8n.hef
+sha256sum -c SHA256SUMS
+```
+
+`sha256 dbabd55f42c9309358398985e055a5c0b45ddbb7a1baae5ccc03e0496e501475`, the
+same value `SHA256SUMS` carries, so the download is checked against git rather
+than against the object store.
+
 The HailoRT version is not incidental. HailoRT's 4.x ioctl protocol is not
 forward compatible, so the userspace library, the Python bindings and the
 `hailo_pci` kernel driver on the board must all be the same major.minor. The
