@@ -10,8 +10,8 @@
       "state": "running",
       "fps": 5.0,
       "decode": "hw",
-      "preview_url": "http://100.82.225.102:8099/preview/cam-0.jpg",
-      "live_url": "http://100.82.225.102:8099/live/cam-0"
+      "preview_url": "http://192.0.2.11:8099/preview/cam-0.jpg",
+      "live_url": "http://192.0.2.11:8099/live/cam-0"
     }
   ],
   "health": {
