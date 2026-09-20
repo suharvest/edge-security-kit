@@ -83,6 +83,10 @@ class StreamWorker:
     tracker: IoUTracker
     decode_primary: str = "sw"
     frame_id: int = 0
+    #: Source dimensions of the last payload, so status_entry can carry the
+    #: same ``frame`` the detection payload carries. The wall derives a tile's
+    #: aspect from it and renders a zero-width tile without it.
+    frame_wh: tuple[int, int] | None = None
     state: str = "stopped"
     store: FrameStore = field(default_factory=FrameStore)
     frame_times: collections.deque = field(
@@ -135,6 +139,8 @@ class StreamWorker:
             # at rather than the value someone last typed into a config file.
             "conf_threshold": round(float(self.conf_threshold), 4),
         }
+        if self.frame_wh is not None:
+            entry["frame"] = {"w": self.frame_wh[0], "h": self.frame_wh[1]}
         if self.config.name:
             entry["name"] = self.config.name
         return entry
@@ -212,6 +218,7 @@ class StreamWorker:
 
         self.frame_id += 1
         height, width = frame.shape[:2]
+        self.frame_wh = (int(width), int(height))
         return {
             "timestamp": now_ms(),
             "frame_id": self.frame_id,

@@ -149,6 +149,10 @@ class StreamWorker:
         self.decode_primary = decode_primary
 
         self.frame_id = 0
+        #: Source dimensions of the last payload, so status_entry can carry the
+        #: same ``frame`` the detection payload carries. The wall derives a
+        #: tile's aspect from it and renders a zero-width tile without it.
+        self.frame_wh: tuple[int, int] | None = None
         self.state = "stopped"
         self.decode = decode_primary
         self.published = 0
@@ -225,6 +229,8 @@ class StreamWorker:
             "conf_threshold": round(float(self.conf_threshold), 4),
             "fallback_active": self.decode != self.decode_primary,
         }
+        if self.frame_wh is not None:
+            entry["frame"] = {"w": self.frame_wh[0], "h": self.frame_wh[1]}
         if self.config.name:
             entry["name"] = self.config.name
         return entry
@@ -318,6 +324,7 @@ class StreamWorker:
         tracked = self.tracker.update(detections, time.monotonic())
         items = detection_items(tracked, getattr(self.backend, "class_name", "person"))
         self.frame_id += 1
+        self.frame_wh = (int(width), int(height))
         return {
             "timestamp": now_ms(),
             "frame_id": self.frame_id,
