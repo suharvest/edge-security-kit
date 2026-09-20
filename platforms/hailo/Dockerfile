@@ -69,9 +69,12 @@ RUN pip install --no-cache-dir --break-system-packages uv \
 
 FROM debian:${DEBIAN_TAG}
 
+# Stamped into the image metadata; override with --build-arg VERSION=<tag> so the
+# label always matches the tag actually pushed.
+ARG VERSION=0.2.0
 LABEL org.opencontainers.image.title="edge-security-detector-hailo" \
       org.opencontainers.image.description="Hailo-8 / 8L person detector for edge-security-kit on Raspberry Pi 5: RTSP in over FFmpeg software decode, sensecraft.detection/1 over MQTT out, with a JPEG preview endpoint. HailoRT and libhailort are mounted from the board, not bundled." \
-      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.source="https://github.com/suharvest/edge-security-kit" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="Seeed Studio"

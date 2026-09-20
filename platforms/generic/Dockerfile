@@ -37,9 +37,12 @@ RUN pip install --no-cache-dir uv \
 
 FROM python:${PYTHON_TAG}
 
+# Stamped into the image metadata; override with --build-arg VERSION=<tag> so the
+# label always matches the tag actually pushed.
+ARG VERSION=0.2.0
 LABEL org.opencontainers.image.title="edge-security-detector-cpu" \
       org.opencontainers.image.description="CPU/ONNX Runtime person detector for edge-security-kit: RTSP in, sensecraft.detection/1 over MQTT out, with a JPEG preview endpoint" \
-      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.source="https://github.com/suharvest/edge-security-kit" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="Seeed Studio"
