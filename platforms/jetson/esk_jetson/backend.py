@@ -40,7 +40,7 @@ class JetsonBackend:
         )
         for name in ("rtsp_codec", "rtsp_latency_ms", "appsink_timeout_ms", "appsink_queue"):
             if hasattr(self.cfg, name):
-                key = name.replace("rtsp_", "") if name == "rtsp_codec" else name
+                key = name.replace("rtsp_", "", 1)
                 kwargs[key] = extra.get(name, getattr(self.cfg, name))
         try:
             return open_source(config.source, **kwargs)
